@@ -181,6 +181,13 @@ def simulate(np_X, Faces, np_YMs, np_PRs, np_Rho, WW, Phi, Handles):
     global simulation_iteration, move_mask, dt, barrier_T
     
     states = []
+    timings = {"SetupClockTime": 0,
+               "HessianAutodiffClockTimes": [],
+               "SolveClockTimes": [],
+               "NewtonIterationClockTimes": [],
+               "StepClockTimes": []}
+    
+    __STARTCLOCKTIME = time.time()
     
     #nx2 sample points
     X0 = torch.tensor(np_X, dtype=torch.float32, requires_grad = True, device=device)
@@ -272,18 +279,26 @@ def simulate(np_X, Faces, np_YMs, np_PRs, np_Rho, WW, Phi, Handles):
     BJMJB = BMB #B.T@J@J.T@M@J@J.T@B
 
     Mg = M@grav
+    
+    __ENDCLOCKTIME = time.time()
+    timings["SetupClockTime"] = __ENDCLOCKTIME - __STARTCLOCKTIME
+
+
     states.append(z.clone().cpu().detach())
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
-
+    
     for step in range(int(scene["Steps"])):
+        __STARTCLOCKTIME = time.time()
         # set u prev at start of step
         z_prev = z.clone().detach()
 
         barrier_T = 0
         for barrier_its in range(int(scene["BarrierIts"])):
             for iter in range(int(scene["NewtonIts"])):
+                __STARTNEWTONTIME = time.time()
+
                 # zero out the gradients of u
                 z.grad = None
 
@@ -296,13 +311,12 @@ def simulate(np_X, Faces, np_YMs, np_PRs, np_Rho, WW, Phi, Handles):
                 # Newton's method minimizes this energy
                 newton_E = partial_newton_E(z)
                 newton_gradE = torch.autograd.grad(newton_E, inputs = z, allow_unused=True)
-
+                __STARTAUTODIFFTIME = time.time()
                 newton_hessE = torch.autograd.functional.hessian(partial_newton_E, inputs = z)
+                __ENDAUTODIFFTIME = time.time()
+                timings["HessianAutodiffClockTimes"].append(__ENDAUTODIFFTIME - __STARTAUTODIFFTIME)
 
-                # 18885544732 PEC
-                # print(newton_E)
-                # print(newton_gradE)
-                # print(torch.sum(newton_hessE))
+
                 with torch.no_grad():
                     newton_H = newton_hessE[:,0,:,0]
 
@@ -316,14 +330,15 @@ def simulate(np_X, Faces, np_YMs, np_PRs, np_Rho, WW, Phi, Handles):
                     else:
                         fixed_H = newton_H
                 
-                    # print(step, torch.dist(fixed_H, newton_H))
-
                     newton_g = torch.cat(newton_gradE)
                     newx = B@z + x0_flat
+
+                    __STARTSOLVETIME = time.time()
                     # Solve for x using J and g
                     dz = -torch.linalg.solve(fixed_H[:, :], newton_g[:])
+                    __ENDSOLVETIME = time.time()
+                    timings["SolveClockTimes"].append(__ENDSOLVETIME - __STARTSOLVETIME)
 
-                    print(torch.norm(newton_g))
                     if (torch.norm(newton_g)<2e-4):
                         print("-----------Converged")
                         break
@@ -331,9 +346,14 @@ def simulate(np_X, Faces, np_YMs, np_PRs, np_Rho, WW, Phi, Handles):
                     # Line Search
                     alpha = line_search(partial_newton_E, z, dz, newton_g)
         
-                    print("ls alpha: ", alpha)
+                    
                     # Update positions 
                     z[:] += alpha*dz
+
+                    __ENDNEWTONTIME = time.time()
+                    timings["NewtonIterationClockTimes"].append(__ENDNEWTONTIME - __STARTNEWTONTIME)
+                    
+                    print("Step: ", step, " - LS alpha: ", alpha, " - gnorm", torch.norm(newton_g))
 
             with torch.no_grad():
                 z_dot = (z - z_prev)/dt
@@ -341,8 +361,14 @@ def simulate(np_X, Faces, np_YMs, np_PRs, np_Rho, WW, Phi, Handles):
             barrier_T += 1
         states.append(z.clone().cpu().detach())
         simulation_iteration += 1
-        torch.save(states, name_and_training_dir+"/" + scene_name + "-sim_states")
+        
+        __ENDCLOCKTIME = time.time()
+        timings["StepClockTimes"].append(__ENDCLOCKTIME - __STARTCLOCKTIME)
 
+        torch.save(states, name_and_training_dir+"/" + scene_name + "-sim_states")
+        # rewrite over training settings, and losses and handle state (final)
+        with open(name_and_training_dir+"/" + scene_name + "sim_timings.json", 'w', encoding='utf-8') as f:
+            json.dump(timings, f, ensure_ascii=False, indent=4)
     return states, X0.cpu().detach(), W.detach()
 
 random_batch_indices = np.random.randint(0, np_object["ObjectSamplePts"].shape[0], size=int(scene["NumCubaturePts"])) 
