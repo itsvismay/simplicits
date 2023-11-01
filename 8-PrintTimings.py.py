@@ -53,17 +53,13 @@ loaded_states = torch.load(object_name+"/"+training_name+"-training" +"/"+str(ar
 
 
 
-def scalar_to_rgb(S_normalized, mincolorstr, maxcolorstr, minval=None, maxval=None):
+def scalar_to_rgb(S_normalized, mincolorstr, maxcolorstr):
     cmap = mcolors.LinearSegmentedColormap.from_list("", [mincolorstr, maxcolorstr])
 
     if(np.sum(S_normalized)==0):
         return cmap(S_normalized)[:, 0:3]*255
     else:
-        if minval == None:
-            minval = np.min(S_normalized)
-        if maxval == None:
-            maxval = np.max(S_normalized)
-        S_normalized = (S_normalized - np.min(S_normalized)) / (maxval - minval)
+        S_normalized = (S_normalized - np.min(S_normalized)) / (np.max(S_normalized) - np.min(S_normalized))
         colors_rgb = cmap(S_normalized)[:, 0:3]*255
         return colors_rgb
 
@@ -83,8 +79,8 @@ def getX(Ts, X0, W):
     X = torch.vmap(x, randomness="same")(X0, W)
     return X[:,0,:]
 
-def getE(X0, YMs, Ts, Handles):
-    poisson = 0.45
+def getE(X0, YMs, PRs, Ts, Handles):
+    poisson = PRs
     mus = YMs/(2*(1+poisson)) #shead modulus
     lams = YMs*poisson/((1+poisson)*(1-2*poisson)) #
 
@@ -103,7 +99,7 @@ def getE(X0, YMs, Ts, Handles):
 
         wTx03s = torch.vmap(inner_over_handles)(Ts, t_W)
         x_i =  torch.sum(wTx03s, dim=0)
-        return x_i.T + x0_i
+        return x_i.T +x0_i
     
     pt_wise_Fs = torch.vmap(torch.func.jacrev(x), randomness="same")(X0)
     pt_wise_E = torch.vmap(elastic_energy, randomness="same")(pt_wise_Fs, mus, lams)
@@ -143,17 +139,6 @@ if "0" in args[3]:
         Ts = loaded_states[i].reshape(-1, 3,4).to(device)
         X = getX(Ts, loaded_O, compute_W_O)
         write_ply(write_samples_folder+object_name+"-"+training_name+"-"+scene_name+"-samplepts-"+str(i)+".ply", X.detach().numpy(), rgb_values, None)
-    
-    if (len(scene["CollisionObjects"])>0):
-        rad = scene["CollisionObjects"][0]["Radius"]
-        for i in range(len(loaded_states)):
-            for p in range(len(scene["CollisionObjects"])):
-                collision_object = np.array(scene["CollisionObjects"][p]["Position"])
-                l_dict = {"collision_obj" : collision_object, "dt" : 0.1, "simulation_iteration" : i}
-                exec(scene["CollisionObjects"][p]["Update_code"], None, l_dict)
-                collision_object = np.array([l_dict["pos"]])
-                write_ply(write_samples_folder+object_name+"-"+training_name+"-"+scene_name+"-CollisionObject-"+str(p)+"-radius-"+str(rad)+"-frame-"+str(i)+".ply",collision_object)
-
         
 # 1 = output push forward verts in ply
 if "1" in args[3]: 
@@ -217,16 +202,14 @@ if "4" in args[3]:
     loaded_ym = torch.tensor(np_object["ObjectYMs"], dtype=torch.float32)
     loaded_pr = torch.tensor(np_object["ObjectPRs"], dtype=torch.float32)
     E0s = getE(loaded_O, loaded_ym, loaded_states[0].reshape(-1, 3,4), loaded_Handles)
-    MAXEN = 1000
     Es = getE(loaded_O, loaded_ym, loaded_states[0].reshape(-1, 3,4), loaded_Handles) - E0s
-    print("MAX ENERGY: ", MAXEN)
-    rgb_values = scalar_to_rgb(Es.detach().numpy(), "magenta", "yellow", 0, MAXEN)
+    rgb_values = scalar_to_rgb(Es.detach().numpy(), "magenta", "yellow")
     for i in range(len(loaded_states)):
         print(i)
         Ts = loaded_states[i].reshape(-1, 3,4).to(device)
         X = getX(Ts, loaded_O, compute_W_O)
         Es = getE(loaded_O, loaded_ym, loaded_states[i].reshape(-1, 3,4), loaded_Handles) - E0s
-        rgb_values = scalar_to_rgb(Es.detach().numpy(), "magenta", "yellow", 0, MAXEN)
+        rgb_values = scalar_to_rgb(Es.detach().numpy(), "magenta", "yellow")
         write_ply(write_energies_folder+object_name+"-"+training_name+"-"+scene_name+"-energies-"+str(i)+".ply", X.detach().numpy(), rgb_values, None)
 
 # 5 = output sample points in ply (colored by nerf colors) (default)

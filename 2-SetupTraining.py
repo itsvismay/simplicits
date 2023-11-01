@@ -51,6 +51,6 @@ if not os.path.exists(object_name+"/"+training_name+"-training"):
 # rewrite over training settings, and losses and handle state (final)
 with open(object_name+"/"+training_name+"-training/training-settings.json", 'w', encoding='utf-8') as f:
     json.dump(training_settings, f, ensure_ascii=False, indent=4)
-torch.save(Handles_post, object_name+"/"+training_name+"-training"+"/losses")
+
 torch.save(Handles_post, object_name+"/"+training_name+"-training"+"/Handles_post")
 torch.save(Handles_pre, object_name+"/"+training_name+"-training"+"/Handles_pre")

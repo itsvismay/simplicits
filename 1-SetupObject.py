@@ -21,9 +21,9 @@ def getDefaultTrainingSettings():
              "NumLayers":10, 
              "LayerWidth":64, 
              "ActivationFunc": "ELU", 
-             "NumTrainingSteps": 20000, 
+             "NumTrainingSteps": 10000, 
              "NumSamplePts": 1000, 
-             "LRStart": 1e-4, 
+             "LRStart": 1e-3, 
              "LREnd": 1e-4,
              "TSamplingStdev": 1, 
              "TBatchSize": 10, 
@@ -384,51 +384,6 @@ def generate_object_and_handles_from_tet_mesh(name, num_handles):
         os.makedirs(name)
     torch.save(np_object, name + "/" +name+"-"+str(num_handles)+"-"+"object")
 
-def generate_mandelbulb(sim_obj_name, num_handles):
-    np_object = generate_object_and_handles_from_sdf("Mandelbulb", num_handles=num_handles, yms=1e6)
-
-def generate_tree_uniform(sim_obj_name, num_handles):
-    np_object = generate_object_and_handles_from_pointcloud("Tree", num_handles=num_handles, postprocess=True)
-    O = np_object["O"]
-    YMs = np_object["YM"]
-    P0inds = np_object["P0_indices"]
-
-    #stiffen the trunk and branches
-    boolTrunkY = O[:,1]<0.5
-    boolTrunkX = np.logical_and(-0.19 < O[:,0], O[:,0] < 0.19) 
-    boolTrunkZ = np.logical_and(-0.19 < O[:,2], O[:,2] < 0.19)
-    boolAll = np.logical_and(np.logical_and(boolTrunkX, boolTrunkZ), boolTrunkY)
-    branchInds = np.nonzero(boolAll)[0]
-    YMs[branchInds] *= 1.0001
-    np_object["YM"] = YMs 
-    np_P0_YM = YMs[P0inds]
-    np_object["P0_indices"] = np_P0_YM
-    plot_implicit(O, np_object["P0"], YMs)
-    if not os.path.exists(sim_obj_name):
-        os.makedirs(sim_obj_name)
-    torch.save(np_object, sim_obj_name + "/" +sim_obj_name+"-"+str(num_handles)+"-"+"object")
-
-def generate_tree_trunks(sim_obj_name, num_handles):
-    np_object = generate_object_and_handles_from_pointcloud("Tree", num_handles=num_handles, postprocess=True)
-    O = np_object["O"]
-    YMs = np_object["YM"]
-    P0inds = np_object["P0_indices"]
-
-    #stiffen the trunk and branches
-    boolTrunkY = O[:,1]<0.5
-    boolTrunkX = np.logical_and(-0.19 < O[:,0], O[:,0] < 0.19) 
-    boolTrunkZ = np.logical_and(-0.19 < O[:,2], O[:,2] < 0.19)
-    boolAll = np.logical_and(np.logical_and(boolTrunkX, boolTrunkZ), boolTrunkY)
-    branchInds = np.nonzero(boolAll)[0]
-    YMs[branchInds] *= 100
-    np_object["YM"] = YMs 
-    np_P0_YM = YMs[P0inds]
-    np_object["P0_indices"] = np_P0_YM
-    plot_implicit(O, np_object["P0"], YMs)
-    if not os.path.exists(sim_obj_name):
-        os.makedirs(sim_obj_name)
-    torch.save(np_object, sim_obj_name + "/" +sim_obj_name+"-"+str(num_handles)+"-"+"object")
-
 def generate_ct_object(sim_obj_name, num_handles):
     fname = "ExampleSetupScripts/Brain/ParaviewOutput/allfacesamplesinverted"
     allfacepc = torch.load(fname, map_location=torch.device("cpu"))
@@ -559,223 +514,74 @@ def generate_heterogeneous_monkey(sim_obj_name, num_handles):
         os.makedirs(sim_obj_name)
     torch.save(np_object, sim_obj_name + "/" +sim_obj_name+"-"+str(num_handles)+"-"+"object")
 
-def generate_simple_skull(sim_obj_name, num_handles, ym1=1e4, ym2=1e7):
-    global SPHERERAD
-    SPHERERAD = 0.3
-   
-    fcn = sdSphere
-    bounds = [[-1,-1,-1], [1,1,1]]
-
-    # 2. uniformly sample bounding box of mesh, throw away sample points outside the mesh
-    uniform_points = np.random.uniform(bounds[0], bounds[1], size=(500000, 3))
-    sdf_vals = np.apply_along_axis(fcn, 1, uniform_points)
-    brain_segment = np.nonzero(sdf_vals <= 0)[0]
-    skull_segment = np.nonzero((sdf_vals < 0.03) & (sdf_vals > 0))[0]
-
-    np_O = uniform_points[np.concatenate((brain_segment, skull_segment), axis=0), :]
-    np_O_sdfval = sdf_vals[np.concatenate((brain_segment, skull_segment), axis=0)]
-    print(brain_segment.shape, skull_segment.shape)
-
-    YMs = np.ones(np_O.shape[0])
-    surfV = None
-    surfF = None
-
-    voxel_grid, voxel_pts, voxel_sdf = voxelize_point_cloud(uniform_points, 0.05, fcn, sdf_vals)
-    tempV, surfF, normals, other = skimage.measure.marching_cubes(voxel_grid, level=0)
-    interior_voxel_pts = voxel_pts[np.nonzero(voxel_sdf<=0)[0], :]
-    surfV = rescale_and_recenter(tempV, np.min(interior_voxel_pts, axis=0), np.max(interior_voxel_pts, axis=0))
-    plot_mesh(surfV, surfF)
-    igl.write_triangle_mesh(sim_obj_name + "/" +sim_obj_name+".obj", surfV, surfF)
-
-    YMs[:brain_segment.shape[0]] *= 1e4
-    YMs[brain_segment.shape[0]:] *= 1e7
-    plot_implicit(np_O, np.zeros((2,3)), YMs)
-
-    # 3. Get approximate vol by summing uniformly sampled verts
-    bb_vol = (np.max(uniform_points[:,0]) - np.min(uniform_points[:,0])) * (np.max(uniform_points[:,1]) - np.min(uniform_points[:,1])) * (np.max(uniform_points[:,2]) - np.min(uniform_points[:,2]))
-    vol_per_sample = bb_vol / uniform_points.shape[0]
-    appx_vol = vol_per_sample*np_O.shape[0]
-    
-
-    # 4. Generate handle points using furthest point sampling
-    indices= np.arange(num_handles) #farthest_point_sampler(torch.tensor(np_O, device="cpu").unsqueeze(0), num_handles).flatten()
-    np_P0_ = np_O[indices, :]
-    np_P0_YM = YMs[indices]
-    plot_implicit(uniform_points, np_P0_)
-
-    # 5. Create and save object
-    np_object = {"O": np_O,
-                 "uniform_sampling_points": uniform_points, 
-                 "uniform_sampling_sdf_vals": sdf_vals,
-                 "P0": np_P0_,
-                 "P0YM": np_P0_YM,
-                 "surfV": surfV,
-                 "surfF": surfF,
-                 "surfYM": None,
-                 "YM": YMs,
-                 "poisson": 0.45,
-                 "vol": appx_vol,
-                 "name": sim_obj_name,
-                 "indices": indices,
-                 "MC_res": 0.02
-                }
-    
-    if not os.path.exists(sim_obj_name):
-        os.makedirs(sim_obj_name)
-    torch.save(np_object, sim_obj_name + "/" +sim_obj_name+"-"+str(num_handles)+"-"+"object")
-
-def generate_from_subspacemfem(sim_obj_name, num_handles):
-    ###########################
-    np_X, np_T, np_F = igl.read_mesh(sim_obj_name + "/" +sim_obj_name+"-"+str(num_handles)+ "-dir/"+"MESH.mesh")
-    np_YM = 1e7*np.ones((np_X.shape[0],1))
-    np_PR = 0.45
-
-    # Compute the Euclidean distance from each point to the origin
-    # Find the indices of points within the specified radius
-    distances = np.linalg.norm(np_X, axis=1)
-    indices_within_radius = np.where(distances <= 0.2)[0]
-    np_YM[indices_within_radius,:] /= 1000
-
-    VOL = torch.tensor(np.sum(igl.volume(np_X, np_T)), dtype=torch.float32, device=device)
-    MUS = torch.tensor(np_YM/(2*(1+np_PR)), dtype=torch.float32, device=device) 
-    LAMS = torch.tensor(np_YM*np_PR/((1+np_PR)*(1-2*np_PR)), dtype=torch.float32, device=device) 
-
-    ###########################
-
-    # # 2. uniformly sample bounding box of mesh, throw away sample points outside the mesh
-    # uniform_points = np.random.uniform(bounds[0], bounds[1], size=(500000, 3))
-    # sdf_vals = np.apply_along_axis(fcn, 1, uniform_points)
-    # brain_segment = np.nonzero(sdf_vals <= 0)[0]
-    # skull_segment = np.nonzero((sdf_vals < 0.05) & (sdf_vals > 0))[0]
-
-    np_O = np_X
-    np_O_sdfval = None
-    
-
-    YMs = np_YM.flatten()
-    surfV = np_X
-    surfF = np_F
-
-    plot_implicit(np_O, np.zeros((2,3)), YMs)
-
-    # 3. Get approximate vol by summing uniformly sampled verts
-    appx_vol = VOL
-    
-
-    # 4. Generate handle points using furthest point sampling
-    indices= np.arange(num_handles) #farthest_point_sampler(torch.tensor(np_O, device="cpu").unsqueeze(0), num_handles).flatten()
-    np_P0_ = np_O[indices, :]
-    np_P0_YM = YMs[indices]
-
-    # 5. Create and save object
-    np_object = {"O": np_O,
-                 "uniform_sampling_points": None, 
-                 "uniform_sampling_sdf_vals": None,
-                 "P0": np_P0_,
-                 "P0YM": np_P0_YM,
-                 "surfV": surfV,
-                 "surfF": surfF,
-                 "surfYM": None,
-                 "YM": YMs,
-                 "poisson": 0.45,
-                 "vol": appx_vol,
-                 "name": sim_obj_name,
-                 "indices": indices,
-                 "MC_res": 0.02
-                }
-    
-    if not os.path.exists(sim_obj_name):
-        os.makedirs(sim_obj_name)
-    torch.save(np_object, sim_obj_name + "/" +sim_obj_name+"-"+str(num_handles)+"-"+"object")
-
-def generate_heterogeneous_beam(sim_obj_name, num_handles):
-    np_object = generate_object_and_handles_from_surf_mesh("511BeamELU", num_handles=num_handles, postprocess=True, yms=1e4)
-    O = np_object["O"]
-    YMs = np_object["YM"]
-
-    #update YMs
-    selection =  O[:,0]<3.5
-    selectionIdxs = np.nonzero(selection)[0]
-    YMs[selectionIdxs] *= 10
-    plot_implicit(O, np_object["P0"], YMs)
-
-    selection2 =  O[:,0]<1.5
-    selectionIdxs2 = np.nonzero(selection2)[0]
-    YMs[selectionIdxs2] *= 10
-
-    np_object["YM"] = YMs 
-    plot_implicit(O, np_object["P0"], YMs)
-
-    if not os.path.exists(sim_obj_name):
-        os.makedirs(sim_obj_name)
-    torch.save(np_object, sim_obj_name + "/" +sim_obj_name+"-"+str(num_handles)+"-"+"object")
-
-def generate_sphere(sim_obj_name, num_handles):
-    global SPHERERAD
-    SPHERERAD = 0.5
-   
-    fcn = sdSphere
-    bounds = [[-1,-1,-1], [1,1,1]]
-
-    # 2. uniformly sample bounding box of mesh, throw away sample points outside the mesh
-    uniform_points = np.random.uniform(bounds[0], bounds[1], size=(500000, 3))
-    sdf_vals = np.apply_along_axis(fcn, 1, uniform_points)
-    brain_segment = np.nonzero(sdf_vals <= 0)[0]
-
-    np_O = uniform_points[brain_segment, :]
-    np_O_sdfval = sdf_vals[brain_segment]
-
-    YMs = 1e7*np.ones(np_O.shape[0])
-    surfV = None
-    surfF = None
-
-    voxel_grid, voxel_pts, voxel_sdf = voxelize_point_cloud(uniform_points, 0.05, fcn, sdf_vals)
-    tempV, surfF, normals, other = skimage.measure.marching_cubes(voxel_grid, level=0)
-    interior_voxel_pts = voxel_pts[np.nonzero(voxel_sdf<=0)[0], :]
-    surfV = rescale_and_recenter(tempV, np.min(interior_voxel_pts, axis=0), np.max(interior_voxel_pts, axis=0))
-    plot_mesh(surfV, surfF)
-    igl.write_triangle_mesh(sim_obj_name + "/" +sim_obj_name+".obj", surfV, surfF)
-
-
-    plot_implicit(np_O, np.zeros((2,3)), YMs)
-
-    # 3. Get approximate vol by summing uniformly sampled verts
-    bb_vol = (np.max(uniform_points[:,0]) - np.min(uniform_points[:,0])) * (np.max(uniform_points[:,1]) - np.min(uniform_points[:,1])) * (np.max(uniform_points[:,2]) - np.min(uniform_points[:,2]))
-    vol_per_sample = bb_vol / uniform_points.shape[0]
-    appx_vol = vol_per_sample*np_O.shape[0]
-    
-
-    # 4. Generate handle points using furthest point sampling
-    indices= np.arange(num_handles) #farthest_point_sampler(torch.tensor(np_O, device="cpu").unsqueeze(0), num_handles).flatten()
-    np_P0_ = np_O[indices, :]
-    np_P0_YM = YMs[indices]
-    plot_implicit(uniform_points, np_P0_)
-
-    # 5. Create and save object
-    np_object = {"O": np_O,
-                 "uniform_sampling_points": uniform_points, 
-                 "uniform_sampling_sdf_vals": sdf_vals,
-                 "P0": np_P0_,
-                 "P0YM": np_P0_YM,
-                 "surfV": surfV,
-                 "surfF": surfF,
-                 "surfYM": None,
-                 "YM": YMs,
-                 "density": 1000,
-                 "poisson": 0.45,
-                 "vol": appx_vol,
-                 "name": sim_obj_name,
-                 "indices": indices,
-                 "MC_res": 0.02
-                }
-    
-    if not os.path.exists(sim_obj_name):
-        os.makedirs(sim_obj_name)
-    torch.save(np_object, sim_obj_name + "/" +sim_obj_name+"-"+str(num_handles)+"-"+"object")
-
 ## NEW OBJECT FORMAT
+def generate_from_pc(name, yms = 1e4, prs = 0.45, rhos = 1000, surf = False, pt_samples = 1000000):
+    fnearname = name + "Near.npz"
+    frandname = name + "Rand.npz"
+    near_npz_file = np.load(fnearname)
+    rand_npz_file = np.load(frandname)
+    positions = np.concatenate((near_npz_file['position'][0::10,:], rand_npz_file['position']))
+    distances = np.concatenate((near_npz_file['distance'][0::10,:], rand_npz_file['distance']))
+    
+    
+    random_batch_indices = np.random.randint(low=0, high= positions.shape[0], size=(pt_samples,))
+    uniform_points_wNans = positions[random_batch_indices,:]
+    sdfs_wNans = distances[random_batch_indices, :]
 
-def generate_from_sdf(name, yms = 1e4, prs = 0.45, rhos = 1000, surf = False):
+    # Create a boolean mask to identify rows with NaN values
+    nan_mask = np.logical_or(np.isnan(uniform_points_wNans).any(axis=1), sdfs_wNans[:,0]>1e3)
+
+    # Remove rows with NaN values using boolean indexing
+    uniform_points = uniform_points_wNans[~nan_mask]
+    sdf_vals = sdfs_wNans[~nan_mask].squeeze()
+    keep_indices = np.nonzero(sdf_vals <= 0.001)[0]
+    np_O = uniform_points[keep_indices, :]
+    np_O_sdf = sdf_vals[keep_indices]
+
+    YMs = yms*np.ones(np_O.shape[0])
+    PRs = prs*np.ones_like(YMs)
+    Rhos = rhos*np.ones_like(YMs)
+    surfV = None
+    surfF = None
+     
+
+    # 3. Marching cubes to recreate the surface mesh from sdf
+    # random_batch_indices = np.random.randint(low=0, high= uniform_points.shape[0], size=(3000,))
+    # fewer_uniform_points = uniform_points[random_batch_indices, :]
+    # fewer_sdf_vals = sdf_vals[random_batch_indices]*1000000
+    # # normalized_vector = 2 * (fewer_sdf_vals - np.min(fewer_sdf_vals)) / (np.max(fewer_sdf_vals) - np.min(fewer_sdf_vals)) - 1
+
+    # voxel_grid, voxel_pts, voxel_sdf = interpolate_point_cloud(points = fewer_uniform_points, voxel_size = 0.05, signed_distances = fewer_sdf_vals)
+    # reconstructed_V, reconstructed_F, normals, other = skimage.measure.marching_cubes(voxel_grid, level=0)
+    # interior_voxel_pts = voxel_pts[np.nonzero(voxel_sdf<=0.001)[0], :]
+    # reconstructed_V = rescale_and_recenter(reconstructed_V, np.min(interior_voxel_pts, axis=0), np.max(interior_voxel_pts, axis=0))
+    # plot_implicit(fewer_uniform_points, np.zeros((2,3)), fewer_sdf_vals)
+    # plot_mesh(reconstructed_V, reconstructed_F)
+
+    # 3. Get approximate vol by summing uniformly sampled verts
+    bb_vol = (np.max(uniform_points[:,0]) - np.min(uniform_points[:,0])) * (np.max(uniform_points[:,1]) - np.min(uniform_points[:,1])) * (np.max(uniform_points[:,2]) - np.min(uniform_points[:,2]))
+    vol_per_sample = bb_vol / uniform_points.shape[0]
+    appx_vol = vol_per_sample*np_O.shape[0]
+
+  
+    # 5. Create and save object
+    np_object = {"Name":type, 
+                 "Dim": 3, 
+                 "BoundingBoxSamplePts": uniform_points, 
+                 "BoundingBoxSignedDists": sdf_vals,
+                 "ObjectSamplePts": np_O, 
+                 "ObjectYMs": YMs, 
+                 "ObjectPRs": PRs, 
+                 "ObjectRho": Rhos, 
+                 "ObjectColors": None,
+                 "ObjectVol": appx_vol, 
+                 "SurfV": surfV, 
+                 "SurfF": surfF, 
+                 "MarchingCubesRes": -1
+                }
+    return np_object
+
+def generate_from_sdf(name, yms = 1e4, prs = 0.45, rhos = 1000, surf = False, pt_samples = 500000):
     global SDBOXSIZE
     global SPHERERAD
     # 1. set fcn to the correct sdf fcn, for now just sdLink
@@ -806,7 +612,7 @@ def generate_from_sdf(name, yms = 1e4, prs = 0.45, rhos = 1000, surf = False):
         fcn = sdBox
     elif name == "Mandelbulb":
         fcn = DE
-        bounds = [[-2,-2,-2], [2,2,2]]
+        bounds = [[-1,-1,-1], [1,1,1]]
     elif name == "Sphere":
         fcn=sdSphere 
         bounds = [[-2,-2,-2], [2,2,2]]
@@ -815,12 +621,11 @@ def generate_from_sdf(name, yms = 1e4, prs = 0.45, rhos = 1000, surf = False):
         return
 
     # 2. uniformly sample bounding box of mesh, throw away sample points outside the mesh
-    uniform_points = np.random.uniform(bounds[0], bounds[1], size=(500000, 3))
+    uniform_points = np.random.uniform(bounds[0], bounds[1], size=(pt_samples, 3))
     sdf_vals = np.apply_along_axis(fcn, 1, uniform_points)
     keep_points = np.nonzero(sdf_vals <= 0)[0] # keep points where sd is not positive
     np_O = uniform_points[keep_points, :]
     np_O_sdfval = sdf_vals[keep_points]
-    plot_implicit(np_O, np_O_sdfval)
 
     YMs = yms*np.ones(np_O.shape[0])
     PRs = prs*np.ones_like(YMs)
@@ -828,6 +633,7 @@ def generate_from_sdf(name, yms = 1e4, prs = 0.45, rhos = 1000, surf = False):
     surfV = None
     surfF = None
 
+    plot_implicit(np_O, np_O_sdfval)
     if surf:
         # 3. Marching cubes to recreate the surface mesh from sdf
         voxel_grid, voxel_pts, voxel_sdf = voxelize_point_cloud(uniform_points, 0.1, fcn, sdf_vals)
@@ -868,7 +674,7 @@ def generate_ct_bladder(sim_obj_name):
     print(bladder)
     bladder = bladder*10
     print(bladder)
-    bladderYM = 10000*np.ones(bladder.shape[0])
+    bladderYM = 1000*np.ones(bladder.shape[0])
     bladderPR = 0.45*np.ones(bladder.shape[0])
     bladderRho = 100*np.ones(bladder.shape[0])
 
@@ -1141,7 +947,7 @@ def generate_ct_abdomen(sim_obj_name):
         with open(sim_obj_name+"/"+sim_obj_name+"-training-settings.json", "w") as outfile:
             outfile.write(json_object)
 
-def generate_simple_skullbrain(sim_obj_name):
+def generate_sdf_simple_skullbrain(sim_obj_name):
     global SPHERERAD
     SPHERERAD = 0.3
    
@@ -1161,11 +967,13 @@ def generate_simple_skullbrain(sim_obj_name):
     surfV = None
     surfF = None
 
-
+    # Trains well on these parameters: ym 1e3,1e7, PR 0.45, Rho 1000
     YMs[:brain_segment.shape[0]] *= 1e3
-    YMs[brain_segment.shape[0]:] *= 1e8
+    YMs[brain_segment.shape[0]:] *= 1e7
     PRs = 0.45*np.ones_like(YMs)
     Rhos = 1000*np.ones_like(YMs)
+
+
     plot_implicit(np_O, YMs)
 
     # 3. Get approximate vol by summing uniformly sampled verts
@@ -1175,6 +983,8 @@ def generate_simple_skullbrain(sim_obj_name):
     
 
     plot_implicit(uniform_points)
+
+    training_dict = getDefaultTrainingSettings()
 
     # 5. Create and save object
     np_object = {"Name":sim_obj_name, 
@@ -1197,13 +1007,12 @@ def generate_simple_skullbrain(sim_obj_name):
     torch.save(np_object, sim_obj_name + "/" +sim_obj_name+"-"+"object")
     
     if not os.path.exists(sim_obj_name+"/"+sim_obj_name+"-training-settings.json"):
-        training_dict = getDefaultTrainingSettings()
         json_object = json.dumps(training_dict, indent=4)
         # Writing to sample.json
         with open(sim_obj_name+"/"+sim_obj_name+"-training-settings.json", "w") as outfile:
             outfile.write(json_object)
 
-def generate_layered_sphere(sim_obj_name):
+def generate_sdf_layered_sphere(sim_obj_name):
     global SPHERERAD
     SPHERERAD = 0.3
    
@@ -1265,15 +1074,13 @@ def generate_layered_sphere(sim_obj_name):
         with open(sim_obj_name+"/"+sim_obj_name+"-training-settings.json", "w") as outfile:
             outfile.write(json_object)
 
-def generate_small_box(sim_obj_name):
+def generate_sdf_small_box(sim_obj_name):
     np_object = generate_from_sdf("Box", yms=1e5)
 
 
     training_dict = getDefaultTrainingSettings()
 
-    training_dict["LRStart"] = 1e-3
-    training_dict["LREnd"] = 1e-4
-    training_dict["TSamplingStdev"] = 1
+    training_dict["TSamplingStdev"] = 0.1
 
     
     if not os.path.exists(sim_obj_name):
@@ -1288,16 +1095,13 @@ def generate_small_box(sim_obj_name):
             outfile.write(json_object)
     pass
 
-def generate_large_box(sim_obj_name):
-    np_object = generate_from_sdf("BigBox", yms=1e3, prs = 0.45, rhos = 100, surf = True)
+def generate_sdf_large_box(sim_obj_name):
+    #Trained on np_object = generate_from_sdf("BigBox", yms=1e4, prs = 0.45, rhos = 1000, surf = False)
+
+    np_object = generate_from_sdf("BigBox", yms=1e5, prs = 0.45, rhos = 100, surf = False)
 
     training_dict = getDefaultTrainingSettings()
-
-    training_dict["LRStart"] = 1e-3
-    training_dict["LREnd"] = 1e-4
-    training_dict["TSamplingStdev"] = 1
-    training_dict["NumTrainingSteps"] = 10000
-
+    training_dict["TSamplingStdev"] = 0.1
     
     if not os.path.exists(sim_obj_name):
         os.makedirs(sim_obj_name)
@@ -1310,16 +1114,10 @@ def generate_large_box(sim_obj_name):
         with open(sim_obj_name+"/"+sim_obj_name+"-training-settings.json", "w") as outfile:
             outfile.write(json_object)
     
-def generate_ribbon(sim_obj_name):
+def generate_sdf_ribbon(sim_obj_name):
     np_object = generate_from_sdf("PaperSheet", yms=1e7, prs=0.45, rhos = 10, surf = True)
 
     training_dict = getDefaultTrainingSettings()
-
-    training_dict["LRStart"] = 1e-4
-    training_dict["LREnd"] = 1e-5
-    training_dict["TSamplingStdev"] = 0.1
-    training_dict["NumTrainingSteps"] = 20000
-    training_dict["NumSamplePts"] = 2000
 
     
     if not os.path.exists(sim_obj_name):
@@ -1328,6 +1126,77 @@ def generate_ribbon(sim_obj_name):
     
     if not os.path.exists(sim_obj_name+"/"+sim_obj_name+"-training-settings.json"):
         
+        json_object = json.dumps(training_dict, indent=4)
+        # Writing to sample.json
+        with open(sim_obj_name+"/"+sim_obj_name+"-training-settings.json", "w") as outfile:
+            outfile.write(json_object)
+
+def generate_sdf_mandelbulb(sim_obj_name):
+    np_object = generate_from_sdf("Mandelbulb", yms=1e4, prs=0.45, rhos = 100, surf = False, pt_samples=500000)
+
+    training_dict = getDefaultTrainingSettings()
+    
+    if not os.path.exists(sim_obj_name):
+        os.makedirs(sim_obj_name)
+    torch.save(np_object, sim_obj_name + "/" +sim_obj_name+"-"+"object")
+    
+    if not os.path.exists(sim_obj_name+"/"+sim_obj_name+"-training-settings.json"):
+        
+        json_object = json.dumps(training_dict, indent=4)
+        # Writing to sample.json
+        with open(sim_obj_name+"/"+sim_obj_name+"-training-settings.json", "w") as outfile:
+            outfile.write(json_object)
+
+def generate_pc_tree(sim_obj_name):
+    #for training i used rho=1000, but 100 should work too
+    np_object = generate_from_pc("Tree", yms=1e4, prs = 0.45, rhos=100)
+    O = np_object["ObjectSamplePts"]
+    YMs = np_object["ObjectYMs"]
+
+    #stiffen the trunk and branches
+    boolTrunkY = O[:,1]<0.5
+    boolTrunkX = np.logical_and(-0.19 < O[:,0], O[:,0] < 0.19) 
+    boolTrunkZ = np.logical_and(-0.19 < O[:,2], O[:,2] < 0.19)
+    boolAll = np.logical_and(np.logical_and(boolTrunkX, boolTrunkZ), boolTrunkY)
+    branchInds = np.nonzero(boolAll)[0]
+    YMs[branchInds] *= 100
+    np_object["ObjectYMs"] = YMs 
+
+    #resize tree, move tree 
+    np_object["ObjectSamplePts"] = O*4
+    minY = np.min(np_object["ObjectSamplePts"][:,1])
+    np_object["ObjectSamplePts"][:,1] -= minY
+    plot_implicit(np_object["ObjectSamplePts"], YMs)
+
+    
+    training_dict = getDefaultTrainingSettings()
+
+    if not os.path.exists(sim_obj_name):
+        os.makedirs(sim_obj_name)
+    torch.save(np_object, sim_obj_name + "/" +sim_obj_name+"-"+"object")
+    
+    if not os.path.exists(sim_obj_name+"/"+sim_obj_name+"-training-settings.json"):
+        json_object = json.dumps(training_dict, indent=4)
+        # Writing to sample.json
+        with open(sim_obj_name+"/"+sim_obj_name+"-training-settings.json", "w") as outfile:
+            outfile.write(json_object)
+
+def generate_pc_spike(sim_obj_name):
+    #trained on ym 1e4, pr 0.45, rho 1000
+    np_object = generate_from_pc("Spike", rhos = 200)
+    O = np_object["ObjectSamplePts"]
+    YMs = np_object["ObjectYMs"]
+
+    
+    plot_implicit(O, YMs)
+
+    training_dict = getDefaultTrainingSettings()
+
+    if not os.path.exists(sim_obj_name):
+        os.makedirs(sim_obj_name)
+    torch.save(np_object, sim_obj_name + "/" +sim_obj_name+"-"+"object")
+    
+    if not os.path.exists(sim_obj_name+"/"+sim_obj_name+"-training-settings.json"):
         json_object = json.dumps(training_dict, indent=4)
         # Writing to sample.json
         with open(sim_obj_name+"/"+sim_obj_name+"-training-settings.json", "w") as outfile:
@@ -1436,14 +1305,29 @@ def generate_nerf_iron(sim_obj_name):
             outfile.write(json_object)
 
 # NEW OBJECT FORMAT
-# generate_ct_abdomen("CTAbdomen")
-# generate_ct_bladder("CTBladder")
-# generate_clean_ct_skullbrain("CTBrain")
-# generate_ct_skullstripped_brain("CTSkullStripped")
-# generate_simple_skullbrain("SimpleBrain2")
-# generate_layered_sphere("LayeredSphere")
-generate_small_box("OrsBox")
-# generate_large_box("LargeBox")
-# generate_ribbon("Ribbon")
-# generate_nerf_tree("NerfTree")
-# generate_nerf_iron("NerfIron")
+
+# Generate CT Objects
+# generate_ct_abdomen("CT_Abdomen")
+# generate_ct_bladder("CT_Bladder_1e3")
+# generate_clean_ct_skullbrain("CT_SkullBrain")
+# generate_ct_skullstripped_brain("CT_SkullStrippedBrain")
+
+# Generate SDF objects
+# generate_sdf_simple_skullbrain("SDF_SimpleSkullBrain")
+# generate_sdf_large_box("SDF_LargeBox") # needs smaller deformation sample size
+# generate_sdf_ribbon("SDF_Ribbon") # needs more its and smaller start/end LR
+# generate_sdf_mandelbulb("SDF_Mandelbulb")
+
+# Generate PC objects
+
+
+# Needs work
+# generate_layered_sphere("SDF_LayeredSphere")
+
+#Generate NERF objects
+# generate_nerf_tree("Nerf_Tree")
+generate_nerf_iron("Nerf_Iron_1e6")
+
+# Generate PC objects
+# generate_pc_tree("PC_Tree")
+# generate_pc_spike("PC_Spike")

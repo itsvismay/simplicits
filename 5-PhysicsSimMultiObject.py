@@ -367,7 +367,7 @@ def simulate(np_X, Faces, np_YMs, np_PRs, np_Rho, WW, Phi, Handles):
 
         torch.save(states, name_and_training_dir+"/" + scene_name + "-sim_states")
         # rewrite over training settings, and losses and handle state (final)
-        with open(name_and_training_dir+"/" + scene_name + "sim_timings.json", 'w', encoding='utf-8') as f:
+        with open(name_and_training_dir+"/" + scene_name + "_sim_timings.json", 'w', encoding='utf-8') as f:
             json.dump(timings, f, ensure_ascii=False, indent=4)
     return states, X0.cpu().detach(), W.detach()
 
