@@ -3,6 +3,7 @@ SDF_*
 PC_*
 Nerf_*
 CT_*
+Mesh_*
 ExampleSetupScripts/
 *.npz
 *.ini
