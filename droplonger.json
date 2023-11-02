@@ -1,0 +1,32 @@
+{ 
+"Description": "Tree", 
+"BoundingX":[-10, 10], 
+"BoundingY":[-10, 10], 
+"BoundingZ":[-10,10],
+"Floor": -1.1, 
+"Gravity": [0, 9.8, 0], 
+"dt": 0.025, 
+"Steps": 100, 
+"NewtonIts": 10, 
+"LSIts": 30,
+"NumCubaturePts": 2000, 
+"penalty_spring_fixed_weight": 10000, 
+"penalty_spring_moving_weight": 0, 
+"penalty_spring_floor_weight": 10000,
+"HessianSPDFix": 0,
+"BarrierInitStiffness": 1,
+"BarrierIts": 1,
+"BarrierUpdate_code": "unused - for python code",
+"SimplicitObjects": [
+    {
+        "Name": "Possibly use this to set up multi object scenes later for io/indexing",
+        "PositionDelta": [0,0,0],
+        "SetFixedBC_code": "indices = torch.nonzero(X0[:,1] < -100.5, as_tuple=False).squeeze() #fix the whole left side of shape",
+        "SetMovingBC_code": "indices = torch.nonzero(X0[:,0] > 400.5, as_tuple=False).squeeze() #move the whole right side of shape",
+        "MoveBC_code": "updated_vert_positions = None #moving_verts; updated_vert_positions = rotate_points_x(moving_verts, 2*(720.0+720)*float(simulation_iteration*dt))"
+    }
+],
+    "CollisionObjects": [
+
+    ]
+}

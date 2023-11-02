@@ -19,7 +19,7 @@ fname = str(args[0])+"/"+str(args[0])
 np_object = torch.load(fname+"-object")
 
 
-print(training_name)
+# print(training_name)
 
 # Opening JSON file with training settings
 with open(fname+"-training-settings.json", 'r') as openfile:
@@ -36,12 +36,12 @@ Handles_pre.eval()
 
 t_O = torch.tensor(np_object["ObjectSamplePts"][:,0:3]).to(device)
 
-for nnnn, pppp in Handles_post.model.named_parameters():
-    print(nnnn, pppp.size())
+# for nnnn, pppp in Handles_post.model.named_parameters():
+#     print(nnnn, pppp.size())
 
-np_W0, np_X0, np_G0 = test(Handles_post, t_O, int(t_O.shape[0]/10))
-plot_handle_regions(np_X0, np_W0, "Pre Training Handle Weights")
-plot_implicit(np_object["ObjectSamplePts"], np_object["ObjectYMs"] )
+# np_W0, np_X0, np_G0 = test(Handles_post, t_O, int(t_O.shape[0]/10))
+# plot_handle_regions(np_X0, np_W0, "Pre Training Handle Weights")
+# plot_implicit(np_object["ObjectSamplePts"], np_object["ObjectYMs"] )
 
 
 print(object_name+"/"+training_name+"-training")

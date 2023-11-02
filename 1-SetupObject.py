@@ -129,158 +129,6 @@ def DE(pos, Bailout=2., Iterations=5, Power=8):
 
 # Generators for different types
 #------------------------
-def generate_object_and_handles_from_sdf(name, num_handles, postprocess=False, yms=1e5):
-    global SDBOXSIZE
-    global SPHERERAD
-    # 1. set fcn to the correct sdf fcn, for now just sdLink
-    fcn = None
-    bounds = [[-1,-1,-1], [1,1,1]]
-    if name == "Link":
-        fcn = sdLink
-        bounds = [[-0.61,-0.61,-0.61], [0.61,0.61,0.61]]
-    elif name == "Box":
-        fcn = sdBox
-        SDBOXSIZE = [1,1,1]
-        bounds = [[-2,-2,-2], [2,2,2]]
-    elif name == "BigBox":
-        fcn = sdBox
-        SDBOXSIZE = [10,10,10]
-        bounds = [[-20,-20,-20], [20,20,20]]
-    elif name == "ThinSheet":
-        SDBOXSIZE = [3,0.4, 0.04]
-        # bounds = [[-3,-0.5,-0.05], [3,0.5,0.05]]
-        # fcn = sdBox
-    elif name == "PaperSheet":
-        SDBOXSIZE = [3,0.4, 0.04]
-        bounds = [[-3,-0.5,-0.5], [3,0.5,0.5]]
-        fcn = sdBox
-    elif name == "ThickerSheet":
-        SDBOXSIZE = [3, 0.4, 0.2]
-        bounds = [[-3,-0.5,-0.5], [3,0.5,0.5]]
-        fcn = sdBox
-    elif name == "Mandelbulb":
-        fcn = DE
-        bounds = [[-2,-2,-2], [2,2,2]]
-    elif name == "Sphere":
-        fcn=sdSphere 
-        bounds = [[-2,-2,-2], [2,2,2]]
-    else:
-        print("Undefined SDF")
-        return
-
-    # 2. uniformly sample bounding box of mesh, throw away sample points outside the mesh
-    uniform_points = np.random.uniform(bounds[0], bounds[1], size=(500000, 3))
-    sdf_vals = np.apply_along_axis(fcn, 1, uniform_points)
-    keep_points = np.nonzero(sdf_vals <= 0)[0] # keep points where sd is not positive
-    np_O = uniform_points[keep_points, :]
-    np_O_sdfval = sdf_vals[keep_points]
-    plot_implicit(np_O, np.zeros((2,3)), np_O_sdfval)
-
-    YMs = yms*np.ones(np_O.shape[0])
-    surfV = None
-    surfF = None
-
-    # 3. Marching cubes to recreate the surface mesh from sdf
-    voxel_grid, voxel_pts, voxel_sdf = voxelize_point_cloud(uniform_points, 0.05, fcn, sdf_vals)
-    tempV, surfF, normals, other = skimage.measure.marching_cubes(voxel_grid, level=0)
-    interior_voxel_pts = voxel_pts[np.nonzero(voxel_sdf<=0)[0], :]
-    surfV = rescale_and_recenter(tempV, np.min(interior_voxel_pts, axis=0), np.max(interior_voxel_pts, axis=0))
-    
-    # 3. Get approximate vol by summing uniformly sampled verts
-    bb_vol = (np.max(uniform_points[:,0]) - np.min(uniform_points[:,0])) * (np.max(uniform_points[:,1]) - np.min(uniform_points[:,1])) * (np.max(uniform_points[:,2]) - np.min(uniform_points[:,2]))
-    vol_per_sample = bb_vol / uniform_points.shape[0]
-    appx_vol = vol_per_sample*np_O.shape[0]
-    
-
-    # 4. Generate handle points using furthest point sampling
-    indices= np.arange(num_handles) #farthest_point_sampler(torch.tensor(np_O, device="cpu").unsqueeze(0), num_handles).flatten()
-    np_P0_ = np_O[indices, :]
-    np_P0_YM = YMs[indices]
-    plot_implicit(uniform_points, np_P0_)
-
-    # 5. Create and save object
-    np_object = {"O": np_O,
-                 "uniform_sampling_points": uniform_points, 
-                 "uniform_sampling_sdf_vals": sdf_vals,
-                 "P0": np_P0_,
-                 "P0YM": np_P0_YM,
-                 "surfV": surfV,
-                 "surfF": surfF,
-                 "surfYM": None,
-                 "YM": YMs,
-                 "poisson": 0.45,
-                 "vol": appx_vol,
-                 "name": name,
-                 "indices": indices,
-                 "MC_res": 0.02
-                }
-    if postprocess:
-        return np_object
-    else:
-        if not os.path.exists(name):
-            os.makedirs(name)
-        torch.save(np_object, name + "/" +name+"-"+str(num_handles)+"-"+"object")
-        return np_object
-
-def generate_object_and_handles_from_surf_mesh(name, num_handles, postprocess = False, yms = 5e6):
-    # 1. read surface mesh obj file
-    surfV, _, _, surfF, _, _ = igl.read_obj(name+".obj")
-
-    # 2. uniformly sample bounding box of mesh, throw away sample points outside the mesh
-    uniform_points = np.random.uniform([np.min(surfV[:,0]), np.min(surfV[:,1]), np.min(surfV[:,2])], [np.max(surfV[:,0]), np.max(surfV[:,1]), np.max(surfV[:,2])], size=(10000, 3))
-    sdf_vals, _, closest = igl.signed_distance(uniform_points, surfV, surfF)
-    keep_points = np.nonzero(sdf_vals <= 0)[0] # keep points where sd is not positive
-    np_O = uniform_points[keep_points, :]
-
-    YMs = yms*np.ones(np_O.shape[0])
-    # for i in range(5):
-    #     start_split = -1e-2+np.min(np_O[:,0]) + i*(np.max(np_O[:,0]) - np.min(np_O[:,0]))/5.0
-    #     end_split = start_split + (np.max(np_O[:,0]) - np.min(np_O[:,0]))/5.0
-    #     print(start_split, end_split)
-    #     start_bools = np_O[:,0]> start_split 
-    #     end_bools = np_O[:,0]< end_split
-    #     bools = np.logical_and(start_bools, end_bools)
-    #     indices = np.nonzero(bools)[0]
-    #     if i%2==1:
-    #         YMs[indices] *= 0.01
-
-    surfYMs = yms*np.ones(surfV.shape[0])
-    # halfway = (np.max(surfV[:,0]) + np.min(surfV[:,0]))/2.0
-    # indices = np.nonzero(surfV[:,0]> halfway)[0]
-    # surfYMs[indices] *= 100
-
-    # 3. Get approximate vol by summing uniformly sampled verts
-    bb_vol = (np.max(surfV[:,0]) - np.min(surfV[:,0])) * (np.max(surfV[:,1]) - np.min(surfV[:,1])) * (np.max(surfV[:,2]) - np.min(surfV[:,2]))
-    vol_per_sample = bb_vol / uniform_points.shape[0]
-    appx_vol = vol_per_sample*np_O.shape[0]
-
-    # 4. Generate handle points using furthest point sampling
-    indices= np.arange(num_handles) #farthest_point_sampler(torch.tensor(np_O, device="cpu").unsqueeze(0), num_handles).flatten()
-    np_P0_ = np_O[indices, :]
-    np_P0_YM = YMs[indices]
-    plot_implicit(np_O, np_P0_, YMs)
-
-    # 5. Create and save object
-    np_object = {"O": np_O,
-                 "uniform_sampling_points": uniform_points, 
-                 "uniform_sampling_sdf_vals": sdf_vals,
-                 "P0": np_P0_,
-                 "P0YM": np_P0_YM,
-                 "surfV": surfV,
-                 "surfF": surfF,
-                 "surfYM": surfYMs,
-                 "YM": YMs,
-                 "poisson": 0.45,
-                 "vol": appx_vol,
-                }
-    if postprocess:
-        return np_object
-    else:
-        if not os.path.exists(name):
-            os.makedirs(name)
-        torch.save(np_object, name + "/" +name+"-"+str(num_handles)+"-"+"object")
-        return np_object
-
 def generate_object_and_handles_from_pointcloud(name, num_handles, postprocess=False):
     fnearname = "C:/Users/vismay/Downloads/samples/near/" + name + ".npz"
     frandname = "C:/Users/vismay/Downloads/samples/rand/" + name + ".npz"
@@ -384,68 +232,6 @@ def generate_object_and_handles_from_tet_mesh(name, num_handles):
         os.makedirs(name)
     torch.save(np_object, name + "/" +name+"-"+str(num_handles)+"-"+"object")
 
-def generate_ct_object(sim_obj_name, num_handles):
-    fname = "ExampleSetupScripts/Brain/ParaviewOutput/allfacesamplesinverted"
-    allfacepc = torch.load(fname, map_location=torch.device("cpu"))
-    #remove shoulder verts
-    allfacepc = allfacepc[allfacepc[:, 2]<210, :]
-    # allfacepc = allfacepc[allfacepc[:, 1]>130, :]   
-    random_batch_indices = np.random.randint(low=0, high= allfacepc.shape[0], size=(int(allfacepc.shape[0]/50),))
-
-    allfacepc = allfacepc[random_batch_indices,:]
-
-    bone = allfacepc[allfacepc[:, 3]>0.1, :] # bone is darker colors (towards 0)
-    softtemp = allfacepc[allfacepc[:, 3]<0.02, :] # soft tissue is lighter (towards 1)
-    soft = softtemp[softtemp[:,3]>0.005,:]
-
-    boneYM = 1e7*np.ones(bone.shape[0])
-    softYM = 1e4*np.ones(soft.shape[0])
-    print(bone.shape, soft.shape)
-
-    np_O = np.concatenate((bone[:,0:3], soft[:, 0:3]), axis=0)/1000.0
-    np_O = rotate_points_x(torch.tensor(np_O, device=device, dtype=torch.float32), -30, axis = 0).cpu().detach().numpy()
-
-    np_YM = np.concatenate((boneYM, softYM)) 
-    np_P0 = np_O[0:num_handles, :]
-    np_P0_YM = np_YM[0:num_handles]
-
-
-    # 3. Get approximate vol by summing uniformly sampled verts
-    # Create a boolean mask for points within the bounding box
-    # Define the two corner points of the bounding box
-    min_corner = np.array([0.240, 0.26, 0.075])
-    max_corner = np.array([0.290, 0.31, 0.125])
-    mask = np.all((np_O >= min_corner) & (np_O <= max_corner), axis=1)
-    # Count the number of points within the bounding box
-    num_points_within_bbox = np.sum(mask)
-    bbvol = 0.05*0.05*0.05
-    bbvol_per_sample = bbvol/num_points_within_bbox
-
-
-    appx_vol = bbvol_per_sample*np_O.shape[0]
-    print("appx vol", appx_vol)
-
-    # 5. Create and save object
-    np_object = {"O": np_O,
-                 "uniform_sampling_points": None, 
-                 "uniform_sampling_sdf_vals": None,
-                 "P0": np_P0,
-                 "P0YM": np_P0_YM,
-                 "surfV": None,
-                 "surfF": None,
-                 "surfYM": None,
-                 "YM": np_YM,
-                 "poisson": 0.4,
-                 "vol": appx_vol,
-                 "name": "skull",
-                 "P0_indices": None
-                }
-    
-    plot_implicit(np_O, np_object["P0"], np_YM)
-    if not os.path.exists(sim_obj_name):
-        os.makedirs(sim_obj_name)
-    torch.save(np_object, sim_obj_name + "/" +sim_obj_name+"-"+str(num_handles)+"-"+"object")
-
 def generate_link(sim_obj_name, num_handles):
     np_object = generate_object_and_handles_from_sdf("Link", num_handles=num_handles, postprocess=True)
     
@@ -472,33 +258,6 @@ def generate_link(sim_obj_name, num_handles):
         os.makedirs(sim_obj_name)
     torch.save(np_object, sim_obj_name + "/" +sim_obj_name+"-"+str(num_handles)+"-"+"object")
 
-def generate_spike(sim_obj_name, num_handles):
-    np_object = generate_object_and_handles_from_pointcloud("Spike", num_handles=num_handles, postprocess=True)
-
-    uniform_points = np_object["uniform_sampling_points"]
-    sdf_vals = np_object["uniform_sampling_sdf_vals"]
-
-    # 3. Marching cubes to recreate the surface mesh from sdf
-    random_batch_indices = np.random.randint(low=0, high= uniform_points.shape[0], size=(10000,))
-    uniform_points_sample = uniform_points[random_batch_indices,:]
-    sdf_vals_sample = sdf_vals[random_batch_indices]
-    voxel_grid, voxel_pts, voxel_sdf = interpolate_point_cloud(uniform_points_sample, 0.1, sdf_vals_sample)
-    tempV, surfF, normals, other = skimage.measure.marching_cubes(voxel_grid, level=0)
-    interior_voxel_pts = voxel_pts[np.nonzero(voxel_sdf<=0)[0], :]
-    surfV = rescale_and_recenter(tempV, np.min(interior_voxel_pts, axis=0), np.max(interior_voxel_pts, axis=0))
-    surfYMs = np_object["YM"][0]*np.ones(surfV.shape[0])
-
-
-    np_object["surfV"] = surfV
-    np_object["surfF"] = surfF
-    np_object["surfYM"] = surfYMs
-
-    plot_mesh(surfV, surfF)
-    
-    if not os.path.exists(sim_obj_name):
-        os.makedirs(sim_obj_name)
-    torch.save(np_object, sim_obj_name + "/" +sim_obj_name+"-"+str(num_handles)+"-"+"object")
-
 def generate_heterogeneous_monkey(sim_obj_name, num_handles):
     np_object = generate_object_and_handles_from_surf_mesh("Monkey", num_handles=5, postprocess=True, yms = 1e4)
     O = np_object["O"]
@@ -515,6 +274,110 @@ def generate_heterogeneous_monkey(sim_obj_name, num_handles):
     torch.save(np_object, sim_obj_name + "/" +sim_obj_name+"-"+str(num_handles)+"-"+"object")
 
 ## NEW OBJECT FORMAT
+def generate_from_towaki_dataset(fnear, frand, yms = 1e5, prs = 0.45, rhos = 1000, surf = False, pt_samples = 1000000):
+    near_npz_file = np.load(fnear)
+    rand_npz_file = np.load(frand)
+    surf_npz_file = np.load(frand.replace("rand", "surface"))
+    positions = np.concatenate((near_npz_file['position'][0::10,:], rand_npz_file['position']))
+    distances = np.concatenate((near_npz_file['distance'][0::10,:], rand_npz_file['distance']))
+    
+    plot_implicit(near_npz_file['position'])
+    
+    random_batch_indices = np.random.randint(low=0, high= positions.shape[0], size=(pt_samples,))
+    uniform_points_wNans = positions[random_batch_indices,:]
+    sdfs_wNans = distances[random_batch_indices, :]
+
+    # Create a boolean mask to identify rows with NaN values
+    nan_mask = np.logical_or(np.isnan(uniform_points_wNans).any(axis=1), sdfs_wNans[:,0]>1e3)
+
+    # Remove rows with NaN values using boolean indexing
+    uniform_points = uniform_points_wNans[~nan_mask]
+    sdf_vals = sdfs_wNans[~nan_mask].squeeze()
+    keep_indices = np.nonzero(sdf_vals <= 0.001)[0]
+    np_O = uniform_points[keep_indices, :]
+    np_O_sdf = sdf_vals[keep_indices]
+
+    YMs = yms*np.ones(np_O.shape[0])
+    PRs = prs*np.ones_like(YMs)
+    Rhos = rhos*np.ones_like(YMs)
+    surfV = None
+    surfF = None
+     
+
+    # 3. Marching cubes to recreate the surface mesh from sdf
+    # random_batch_indices = np.random.randint(low=0, high= uniform_points.shape[0], size=(3000,))
+    # fewer_uniform_points = uniform_points[random_batch_indices, :]
+    # fewer_sdf_vals = sdf_vals[random_batch_indices]*1000000
+    # # normalized_vector = 2 * (fewer_sdf_vals - np.min(fewer_sdf_vals)) / (np.max(fewer_sdf_vals) - np.min(fewer_sdf_vals)) - 1
+
+    # voxel_grid, voxel_pts, voxel_sdf = interpolate_point_cloud(points = fewer_uniform_points, voxel_size = 0.05, signed_distances = fewer_sdf_vals)
+    # reconstructed_V, reconstructed_F, normals, other = skimage.measure.marching_cubes(voxel_grid, level=0)
+    # interior_voxel_pts = voxel_pts[np.nonzero(voxel_sdf<=0.001)[0], :]
+    # reconstructed_V = rescale_and_recenter(reconstructed_V, np.min(interior_voxel_pts, axis=0), np.max(interior_voxel_pts, axis=0))
+    # plot_implicit(fewer_uniform_points, np.zeros((2,3)), fewer_sdf_vals)
+    # plot_mesh(reconstructed_V, reconstructed_F)
+
+    # 3. Get approximate vol by summing uniformly sampled verts
+    bb_vol = (np.max(uniform_points[:,0]) - np.min(uniform_points[:,0])) * (np.max(uniform_points[:,1]) - np.min(uniform_points[:,1])) * (np.max(uniform_points[:,2]) - np.min(uniform_points[:,2]))
+    vol_per_sample = bb_vol / uniform_points.shape[0]
+    appx_vol = vol_per_sample*np_O.shape[0]
+
+  
+    # 5. Create and save object
+    np_object = {"Name":type, 
+                 "Dim": 3, 
+                 "BoundingBoxSamplePts": uniform_points, 
+                 "BoundingBoxSignedDists": sdf_vals,
+                 "ObjectSamplePts": np_O, 
+                 "ObjectYMs": YMs, 
+                 "ObjectPRs": PRs, 
+                 "ObjectRho": Rhos, 
+                 "ObjectColors": None,
+                 "ObjectVol": appx_vol, 
+                 "SurfV": surfV, 
+                 "SurfF": surfF, 
+                 "MarchingCubesRes": -1
+                }
+    return np_object
+
+def generate_from_mesh(name, yms = 1e4, prs = 0.45, rhos = 1000, surf = False, pt_samples = 1000000):
+    # 1. read surface mesh obj file
+    surfV, _, _, surfF, _, _ = igl.read_obj(name+".obj")
+
+    # 2. uniformly sample bounding box of mesh, throw away sample points outside the mesh
+    uniform_points = np.random.uniform([np.min(surfV[:,0]), np.min(surfV[:,1]), np.min(surfV[:,2])], [np.max(surfV[:,0]), np.max(surfV[:,1]), np.max(surfV[:,2])], size=(pt_samples, 3))
+    sdf_vals, _, closest = igl.signed_distance(uniform_points, surfV, surfF)
+    keep_points = np.nonzero(sdf_vals <= 0)[0] # keep points where sd is not positive
+    np_O = uniform_points[keep_points, :]
+
+    YMs = yms*np.ones(np_O.shape[0])
+    PRs = prs*np.ones_like(YMs)
+    Rhos = rhos*np.ones_like(YMs)
+
+    # 3. Get approximate vol by summing uniformly sampled verts
+    bb_vol = (np.max(surfV[:,0]) - np.min(surfV[:,0])) * (np.max(surfV[:,1]) - np.min(surfV[:,1])) * (np.max(surfV[:,2]) - np.min(surfV[:,2]))
+    vol_per_sample = bb_vol / uniform_points.shape[0]
+    appx_vol = vol_per_sample*np_O.shape[0]
+
+    plot_implicit(np_O, YMs)
+
+    # 5. Create and save object
+    np_object = {"Name":type, 
+                 "Dim": 3, 
+                 "BoundingBoxSamplePts": uniform_points, 
+                 "BoundingBoxSignedDists": sdf_vals,
+                 "ObjectSamplePts": np_O, 
+                 "ObjectYMs": YMs, 
+                 "ObjectPRs": PRs, 
+                 "ObjectRho": Rhos, 
+                 "ObjectColors": None,
+                 "ObjectVol": appx_vol, 
+                 "SurfV": surfV, 
+                 "SurfF": surfF, 
+                 "MarchingCubesRes": -1
+                }
+    return np_object
+    
 def generate_from_pc(name, yms = 1e4, prs = 0.45, rhos = 1000, surf = False, pt_samples = 1000000):
     fnearname = name + "Near.npz"
     frandname = name + "Rand.npz"
@@ -664,6 +527,36 @@ def generate_from_sdf(name, yms = 1e4, prs = 0.45, rhos = 1000, surf = False, pt
                 }
     return np_object
     
+def generate_mesh_511beam(sim_obj_name):
+    np_object = generate_from_mesh("511Beam", yms = 5e6, prs = 0.45, rhos = 1000, pt_samples=100000)
+    training_dict = getDefaultTrainingSettings()
+    training_dict["TSamplingStdev"] = 0.1
+    if not os.path.exists(sim_obj_name):
+        os.makedirs(sim_obj_name)
+    torch.save(np_object, sim_obj_name + "/" +sim_obj_name+"-"+"object")
+    
+    if not os.path.exists(sim_obj_name+"/"+sim_obj_name+"-training-settings.json"):
+        
+        json_object = json.dumps(training_dict, indent=4)
+        # Writing to sample.json
+        with open(sim_obj_name+"/"+sim_obj_name+"-training-settings.json", "w") as outfile:
+            outfile.write(json_object)
+
+def generate_mesh_beam(sim_obj_name):
+    np_object = generate_from_mesh("Beam", yms = 5e6, prs = 0.45, rhos = 1000, pt_samples=100000)
+    training_dict = getDefaultTrainingSettings()
+
+    if not os.path.exists(sim_obj_name):
+        os.makedirs(sim_obj_name)
+    torch.save(np_object, sim_obj_name + "/" +sim_obj_name+"-"+"object")
+    
+    if not os.path.exists(sim_obj_name+"/"+sim_obj_name+"-training-settings.json"):
+        
+        json_object = json.dumps(training_dict, indent=4)
+        # Writing to sample.json
+        with open(sim_obj_name+"/"+sim_obj_name+"-training-settings.json", "w") as outfile:
+            outfile.write(json_object)
+
 def generate_ct_bladder(sim_obj_name):
     fname = "ExampleSetupScripts/Bladder/BladderCloud.obj"
     bladder, _, _, _, _, _ = igl.read_obj(fname)
@@ -1012,6 +905,31 @@ def generate_sdf_simple_skullbrain(sim_obj_name):
         with open(sim_obj_name+"/"+sim_obj_name+"-training-settings.json", "w") as outfile:
             outfile.write(json_object)
 
+def generate_towaki_dataset(sim_dataset_name):
+    root_folder = "C:/Users/vismay/Downloads/samples/"
+    near_folder = root_folder + "near/"
+    rand_folder = root_folder + "rand/"
+
+    object_near_list = [obj_name for obj_name in os.listdir(str(near_folder)) if obj_name.endswith(".npz") ]
+    object_rand_set = set([obj_name for obj_name in os.listdir(str(rand_folder)) if obj_name.endswith(".npz") ])
+
+    for obj in object_near_list[1:2]:
+        if obj in object_rand_set:
+            sim_obj_name = sim_dataset_name + obj.split(".")[0]
+            print(sim_obj_name, near_folder + obj, rand_folder + obj)
+            np_object =  generate_from_towaki_dataset(near_folder + obj, rand_folder + obj)
+            training_dict = getDefaultTrainingSettings()
+            break
+            if not os.path.exists(sim_obj_name):
+                os.makedirs(sim_obj_name)
+            torch.save(np_object, sim_obj_name + "/" +sim_obj_name+"-"+"object")
+            
+            if not os.path.exists(sim_obj_name+"/"+sim_obj_name+"-training-settings.json"):
+                json_object = json.dumps(training_dict, indent=4)
+                # Writing to sample.json
+                with open(sim_obj_name+"/"+sim_obj_name+"-training-settings.json", "w") as outfile:
+                    outfile.write(json_object)
+    
 def generate_sdf_layered_sphere(sim_obj_name):
     global SPHERERAD
     SPHERERAD = 0.3
@@ -1305,7 +1223,7 @@ def generate_nerf_iron(sim_obj_name):
             outfile.write(json_object)
 
 # NEW OBJECT FORMAT
-
+# generate_towaki_dataset("SDF_Towaki_")
 # Generate CT Objects
 # generate_ct_abdomen("CT_Abdomen")
 # generate_ct_bladder("CT_Bladder_1e3")
@@ -1318,15 +1236,16 @@ def generate_nerf_iron(sim_obj_name):
 # generate_sdf_ribbon("SDF_Ribbon") # needs more its and smaller start/end LR
 # generate_sdf_mandelbulb("SDF_Mandelbulb")
 
-# Generate PC objects
-
+# Generate Mesh objects
+generate_mesh_511beam("Mesh_511BeamELU1000Density")
+# generate_mesh_beam("Mesh_BeamELU")
 
 # Needs work
 # generate_layered_sphere("SDF_LayeredSphere")
 
 #Generate NERF objects
 # generate_nerf_tree("Nerf_Tree")
-generate_nerf_iron("Nerf_Iron_1e6")
+# generate_nerf_iron("Nerf_Iron_1e6")
 
 # Generate PC objects
 # generate_pc_tree("PC_Tree")

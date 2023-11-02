@@ -1,0 +1,17 @@
+{
+    "NumHandles": 10,
+    "NumLayers": 10,
+    "LayerWidth": 64,
+    "ActivationFunc": "ELU",
+    "NumTrainingSteps": 10000,
+    "NumSamplePts": 1000,
+    "LRStart": 0.001,
+    "LREnd": 0.0001,
+    "TSamplingStdev": 1,
+    "TBatchSize": 10,
+    "LossCurveMovingAvgWindow": 100,
+    "SaveHandleIts": 1000,
+    "SaveSampleIts": 20000,
+    "NumSamplesToView": 5,
+    "Timeit": true
+}
