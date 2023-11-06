@@ -5,9 +5,9 @@ from SimplicitHelpers import *
 import os
 import skimage
 from PhysicsHelpers import *
-import potpourri3d as pp3d
+# import potpourri3d as pp3d
 import json
-from plyfile import PlyData 
+# from plyfile import PlyData
 
 # SDFs
 global SDBOXSIZE
@@ -775,7 +775,7 @@ def generate_sphere(sim_obj_name, num_handles):
 
 ## NEW OBJECT FORMAT
 
-def generate_from_sdf(name, yms = 1e4, prs = 0.45, rhos = 1000, surf = False):
+def generate_from_sdf(name, yms = 1e4, prs = 0.45, rhos = 1000, surf = False, show_plot=True):
     global SDBOXSIZE
     global SPHERERAD
     # 1. set fcn to the correct sdf fcn, for now just sdLink
@@ -820,7 +820,8 @@ def generate_from_sdf(name, yms = 1e4, prs = 0.45, rhos = 1000, surf = False):
     keep_points = np.nonzero(sdf_vals <= 0)[0] # keep points where sd is not positive
     np_O = uniform_points[keep_points, :]
     np_O_sdfval = sdf_vals[keep_points]
-    plot_implicit(np_O, np_O_sdfval)
+    if show_plot:
+        plot_implicit(np_O, np_O_sdfval)
 
     YMs = yms*np.ones(np_O.shape[0])
     PRs = prs*np.ones_like(YMs)
@@ -1442,7 +1443,7 @@ def generate_nerf_iron(sim_obj_name):
 # generate_ct_skullstripped_brain("CTSkullStripped")
 # generate_simple_skullbrain("SimpleBrain2")
 # generate_layered_sphere("LayeredSphere")
-generate_small_box("OrsBox")
+# generate_small_box("OrsBox")
 # generate_large_box("LargeBox")
 # generate_ribbon("Ribbon")
 # generate_nerf_tree("NerfTree")

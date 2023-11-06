@@ -12,8 +12,7 @@ import polyscope.imgui as psim
 import inspect
 from scipy.interpolate import RBFInterpolator
 import matplotlib.colors as mcolors
-# from vectoradam import * 
-from siren_pytorch import SirenNet
+# from vectoradam import *
 import time
 
 
@@ -496,6 +495,7 @@ class HandleModels():
                                             num_layers = num_layers)
         
         elif activation_func == "SIREN":
+            from siren_pytorch import SirenNet
             self.model = SirenNet(
                                 dim_in = dim,                        # input dimension, ex. 2d coor
                                 dim_hidden = layer_width,                  # hidden dimension
