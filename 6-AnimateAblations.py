@@ -34,17 +34,20 @@ def getX(Ts, l_X0, l_W):
     X = torch.vmap(x, randomness="same")(l_X0.to(device), l_W.to(device))
     return X[:,0,:].cpu().detach().numpy()
 
+#Read in the object (hardcoded for now)
+args = sys.argv[1:]
+object_name = str(args[0])
 
-object_list = [obj_name for obj_name in os.listdir("./") if obj_name.startswith("SDF_Towaki")]
-
-
+# DO THE TRAINING
+training_list = [name.split("-training")[0] for name in os.listdir(object_name) if name.startswith("ablation_") and len(name.split("_"))<3]
+print(training_list)
 def getObjectSimulation(object_name, training_name, scene_name):
     #Read in the object (hardcoded for now)
     name_and_training_dir = object_name+"/"+training_name+"-training"
     fname = object_name +"/"+object_name
 
     # Opening JSON file with training settings
-    with open(fname+"-training-settings.json", 'r') as openfile:
+    with open(name_and_training_dir+"/training-settings.json", 'r') as openfile:
         training_settings = json.load(openfile)
     np_object = torch.load(fname+"-object")
     scene = json.loads(open(name_and_training_dir + "/../"+scene_name+".json", "r").read())
@@ -55,16 +58,21 @@ def getObjectSimulation(object_name, training_name, scene_name):
     loaded_X0 = torch.tensor(np_object["ObjectSamplePts"],  dtype=torch.float32)
     # loaded_X0 = torch.load(object_name+"/"+training_name+"-training" +"/"+str(args[2])+"-sim_X0", map_location=torch.device(device))
     loaded_ym = torch.tensor(np_object["ObjectYMs"]).detach().numpy()
+
+    V0 = torch.tensor(np_object["SurfV"], dtype=torch.float32)
+    F = np_object["SurfF"]
+
     # loaded_ym = torch.ones(loaded_X0.shape[0])
     loaded_states = torch.load(object_name+"/"+training_name+"-training" +"/"+scene_name+"-sim_states", map_location=torch.device(device))
-    computed_W_X0 =  torch.cat((loaded_Handles.getAllWeightsSoftmax(loaded_X0), torch.ones(loaded_X0.shape[0], 1)), dim=1) 
+    computed_W_X0 =  torch.cat((loaded_Handles.getAllWeightsSoftmax(V0), torch.ones(V0.shape[0], 1)), dim=1) 
+    
 
-    return loaded_X0, loaded_ym, loaded_states, computed_W_X0, scene
+    return V0, F, loaded_ym, loaded_states, computed_W_X0, scene
 
-obj_id = 0
+training_id = 0
 frame_num = 0
 
-X0, YM, STATES, WX0, scene = getObjectSimulation(object_list[obj_id], "test1", "dropstiffer")
+V0, F, YM, STATES, WX0, scene = getObjectSimulation(object_name, training_list[0], "twist")
 
 ps.init()
 #set bounding box for floor plane and scene extents
@@ -81,8 +89,9 @@ ps.set_bounding_box(low, high)
 ps.set_ground_plane_height_factor(-float(scene["Floor"]) + float(scene["BoundingY"][0]), is_relative=False) # adjust the plane height
 
 
-ps_cloud = ps.register_point_cloud("samples", X0.cpu().numpy(), enabled=True)
-ps_cloud.add_scalar_quantity("yms", YM, enabled=True)
+
+
+ps_surf = ps.register_surface_mesh("samples", V0.cpu().numpy(), F, enabled=True)
 
 
 if (len(scene["CollisionObjects"])>0):
@@ -96,7 +105,7 @@ if (len(scene["CollisionObjects"])>0):
 autoplay = False 
 
 def callback():
-    global frame_num, obj_id, autoplay, X0, YM, WX0, STATES, scene, ps_cloud
+    global frame_num, training_id, autoplay, V0, YM, WX0, STATES, scene, ps_surf
 
     if(psim.Button("Autoplay Toggle")):
         # This code is executed when the button is pressed
@@ -108,32 +117,32 @@ def callback():
     if autoplay:
         time.sleep(0.01)
         frame_num += 1
-        if obj_id == len(object_list):
-            obj_id = 0
+        if training_id == len(training_list):
+            training_id = 0
             frame_num = 0
             change_object1 = True
             change_framenum1 = True
         
         if frame_num == len(STATES):
             frame_num = 0
-            obj_id += 1
+            training_id += 1
             change_object1 = True
     
         change_framenum1 = True
 
-    change_object2, obj_id = psim.SliderInt("ObjectIndex:", obj_id, v_min=0, v_max=len(object_list))
+    change_object2, training_id = psim.SliderInt("Training Index:", training_id, v_min=0, v_max=len(training_list)-1)
     change_framenum2, frame_num = psim.SliderInt("Frame", frame_num, v_min=0, v_max=len(STATES)-1)
-
+    if change_object2 or change_object1:
+        print(training_list[training_id])
     if change_object1 or change_object2:
-        X0, YM, STATES, WX0, scene  = getObjectSimulation(object_list[obj_id], "test1", "dropstiffer")
+        V0, F, YM, STATES, WX0, scene  = getObjectSimulation(object_name, training_list[training_id], "twist")
         change_framenum2 = True
-        ps_cloud = ps.register_point_cloud("samples", X0.cpu().numpy(), enabled=True)
-        ps_cloud.add_scalar_quantity("yms", YM, enabled=True)
+        ps_surf = ps.register_surface_mesh("samples", V0.cpu().numpy(), F, enabled=True)
 
     if change_framenum1 or change_framenum2:
         Ts = STATES[frame_num].reshape(-1, 3,4)
-        X = getX(Ts, X0, WX0)
-        ps_cloud.update_point_positions(X)
+        X = getX(Ts, V0, WX0)
+        ps_surf.update_vertex_positions(X)
 
         if (len(scene["CollisionObjects"])>0):
             for p in range(len(scene["CollisionObjects"])):

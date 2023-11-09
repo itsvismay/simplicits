@@ -18,7 +18,7 @@ fname = str(args[0])+"/"+str(args[0])
 np_object = torch.load(fname+"-object")
 
 # Opening JSON file with training settings
-with open(fname+"-training-settings.json", 'r') as openfile:
+with open(object_name+"/"+training_name+"-training/training-settings.json", 'r') as openfile:
     training_settings = json.load(openfile)
 
 name_and_training_dir = object_name+"/"+training_name+"-training"
@@ -38,9 +38,22 @@ stiffer_indices = torch.where(t_YMs == ym_max_val)[0]
 
 TOTAL_TRAINING_STEPS = int(training_settings["NumTrainingSteps"])
 
-ENERGY_INTERP_LINSPACE = np.linspace(0, 1, TOTAL_TRAINING_STEPS, endpoint=False)
+LE_End = 1
+T_only = 0
+if "LE" in training_name.split("_")[-1]:
+    print("LE")
+    LE_End = 0
+if "T" in training_name.split("_")[-1]:
+    print("T")
+    T_only = 1
+    
+ENERGY_INTERP_LINSPACE = np.linspace(0, LE_End, TOTAL_TRAINING_STEPS, endpoint=False)
 LR_INTERP_LINSPCE = np.linspace(float(training_settings["LRStart"]), float(training_settings["LREnd"]), TOTAL_TRAINING_STEPS, endpoint=True)
 YM_INTERP_LINSPACE = np.linspace(ym_max_val.cpu().detach().numpy(), ym_max_val.cpu().detach().numpy(), TOTAL_TRAINING_STEPS, endpoint=True)
+eps = 0.0001
+eps0 = torch.tensor([eps, 0, 0]).to(device)
+eps1 = torch.tensor([0, eps, 0]).to(device)
+eps2 = torch.tensor([0, 0, eps]).to(device)
 
 def interp(e, TOT):
     #logarithmic
@@ -99,8 +112,53 @@ def E_pot(W,X0, mus, lams, Ts, Handles, interp_val):
         wTx03s = torch.vmap(inner_over_handles)(Ts, t_W)
         x_i =  torch.sum(wTx03s, dim=0) 
         return x_i.T + x0_i
+    
+    def fdF2(x0):
+        #left
+        xx = x0 + eps0
+        left = x(xx)
+        xx = x0 - eps0
+        right = x(xx)
+        col1 = (left - right)/(2*eps)
+
+        xx = x0 + eps1
+        left = x(xx)
+        xx = x0 - eps1
+        right = x(xx)
+        col2 = (left - right)/(2*eps)
+        
+        xx = x0 + eps2
+        left = x(xx)
+        xx = x0 - eps2
+        right = x(xx)
+        col3 = (left - right)/(2*eps)
+        
+        # Create a PyTorch matrix from the columns
+        return torch.stack((col1, col2, col3), dim=1)
+
+    def fdF1(x0):
+        right = x(x0)
+        #left
+        xx = x0 + eps0
+        left = x(xx)
+        col1 = (left - right)/(eps)
+
+        xx = x0 + eps1
+        left = x(xx)
+        col2 = (left - right)/(eps)
+        
+        xx = x0 + eps2
+        left = x(xx)
+        col3 = (left - right)/(eps)
+        
+        # Create a PyTorch matrix from the columns
+        return torch.stack((col1, col2, col3), dim=1)
+
+
+
 
     pt_wise_Fs = torch.vmap(torch.func.jacrev(x), randomness="same")(X0)
+    # pt_wise_Fs = torch.vmap(fdF1, randomness="same")(X0)
     pt_wise_E = torch.vmap(elastic_energy, randomness="same")(pt_wise_Fs, mus, lams)
     totE = (np_object["ObjectVol"]/X0.shape[0])*(pt_wise_E.sum())
     return totE
@@ -222,7 +280,7 @@ clock = []
 
 steps = TOTAL_TRAINING_STEPS
 for e in range(1, steps):
-    batchTs = getBatchOfTs(Handles_post.num_handles, int(training_settings["TBatchSize"]), e)
+    batchTs = getBatchOfTs(Handles_post.num_handles, int(training_settings["TBatchSize"]), t_only=T_only)
     t_batchTs = batchTs.to(device).float()*float(training_settings["TSamplingStdev"])
     STARTCLOCKTIME = time.time()
     STARTCUDATIME.record()

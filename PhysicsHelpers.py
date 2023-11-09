@@ -49,5 +49,3 @@ def rotate_points_x(points, d, axis = 0):
     # Extract the rotated points without the homogeneous coordinates
     rotated_points = transformed_points[:, :3]
     return rotated_points
-
-

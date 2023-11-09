@@ -34,8 +34,8 @@ with open(fname+"-training-settings.json", 'r') as openfile:
 np_object = torch.load(fname+"-object")
 scene = json.loads(open(name_and_training_dir + "/../"+str(args[2])+".json", "r").read())
 
-
-loaded_Handles = torch.load(object_name+"/"+training_name+"-training" + "/Handles_post",  map_location=torch.device(device))
+use_handle_its = scene["HandleIts"] if "HandleIts" in scene else ""
+loaded_Handles = torch.load(object_name+"/"+training_name+"-training" + "/Handles_post"+use_handle_its,  map_location=torch.device(device))
 
 for nnnn, pppp in loaded_Handles.model.named_parameters():
     print(nnnn, pppp.size())

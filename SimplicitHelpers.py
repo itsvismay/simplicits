@@ -581,25 +581,33 @@ def getRandomDeltas(ind):
     #     angle = math.radians(random.uniform(-40, 40))
     #     return (3, angle)
 
-def getTransformsFromDeltas(d, num_handles):
+def getTransformsFromDeltas(d, num_handles, t_only = 0):
     # return [np.array([[0, 0, 0, 0.2], 
     #                       [0, 0, 0, 0.2],
     #                       [0, 0, 0, 0.2]]) for i in range(num_handles)]
-    if d==0:
-        return [np.array([[np.random.randn(1)[0], np.random.randn(1)[0], np.random.randn(1)[0], 1*np.random.randn(1)[0]], 
-                          [np.random.randn(1)[0], np.random.randn(1)[0], np.random.randn(1)[0], 1*np.random.randn(1)[0]],
-                          [np.random.randn(1)[0], np.random.randn(1)[0], np.random.randn(1)[0], 1*np.random.randn(1)[0]]]) for i in range(num_handles)]
+    # if d==0:
+    #     return [np.array([[np.random.randn(1)[0], np.random.randn(1)[0], np.random.randn(1)[0], 1*np.random.randn(1)[0]], 
+    #                       [np.random.randn(1)[0], np.random.randn(1)[0], np.random.randn(1)[0], 1*np.random.randn(1)[0]],
+    #                       [np.random.randn(1)[0], np.random.randn(1)[0], np.random.randn(1)[0], 1*np.random.randn(1)[0]]]) for i in range(num_handles)]
         
-    else:
+    # else:
+
+    # Full Affine training
+    if t_only ==0:
         return [np.array([[np.random.randn(1)[0], np.random.randn(1)[0], np.random.randn(1)[0], 1*np.random.randn(1)[0]], 
-                          [np.random.randn(1)[0], np.random.randn(1)[0], np.random.randn(1)[0], 1*np.random.randn(1)[0]],
-                          [np.random.randn(1)[0], np.random.randn(1)[0], np.random.randn(1)[0], 1*np.random.randn(1)[0]]]) for i in range(num_handles)]
+                        [np.random.randn(1)[0], np.random.randn(1)[0], np.random.randn(1)[0], 1*np.random.randn(1)[0]],
+                        [np.random.randn(1)[0], np.random.randn(1)[0], np.random.randn(1)[0], 1*np.random.randn(1)[0]]]) for i in range(num_handles)]
+    else:
+    # Translations only training
+        return [np.array([[0, 0, 0, 1*np.random.randn(1)[0]], 
+                        [0, 0, 0, 1*np.random.randn(1)[0]],
+                        [0, 0, 0, 1*np.random.randn(1)[0]]]) for i in range(num_handles)]
 
     
-def getBatchOfTs(num_handles, batch_size, epoch):
+def getBatchOfTs(num_handles, batch_size, t_only=0):
     batchTs = []
     for b in range(batch_size):
-        Ts =getTransformsFromDeltas(biased_random(), num_handles)
+        Ts =getTransformsFromDeltas(biased_random(), num_handles, t_only)
         # Ts =getTransformsFromDeltas(-3, num_handles) #hard coded to Id deformations
         batchTs.append(Ts)
     return torch.tensor(np.array(batchTs))

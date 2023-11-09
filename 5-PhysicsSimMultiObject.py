@@ -26,8 +26,8 @@ with open(fname+"-training-settings.json", 'r') as openfile:
     training_settings = json.load(openfile)
 np_object = torch.load(fname+"-object")
 scene = json.loads(open(name_and_training_dir + "/../"+str(args[2])+".json", "r").read())
-
-Handles_post = torch.load(object_name+"/"+training_name+"-training" + "/Handles_post")
+use_handle_its = scene["HandleIts"] if "HandleIts" in scene else ""
+Handles_post = torch.load(object_name+"/"+training_name+"-training" + "/Handles_post"+use_handle_its)
 Handles_post.to_device(device)
 Handles_post.eval()
 
@@ -77,7 +77,61 @@ def E_pot(X0,  W, Faces, YMs, Ts, Handles):
         x_i =  torch.sum(wTx03s, dim=0)
         return x_i.T +x0_i
     
+    def fdF2(x0):
+        eps = 0.0001
+        eps0 = torch.tensor([eps, 0, 0]).to(device)
+        eps1 = torch.tensor([0, eps, 0]).to(device)
+        eps2 = torch.tensor([0, 0, eps]).to(device)
+        #left
+        xx = x0 + eps0
+        left = x(xx)
+        xx = x0 - eps0
+        right = x(xx)
+        col1 = (left - right)/(2*eps)
+
+        xx = x0 + eps1
+        left = x(xx)
+        xx = x0 - eps1
+        right = x(xx)
+        col2 = (left - right)/(2*eps)
+        
+        xx = x0 + eps2
+        left = x(xx)
+        xx = x0 - eps2
+        right = x(xx)
+        col3 = (left - right)/(2*eps)
+        
+        # Create a PyTorch matrix from the columns
+        return torch.stack((col1, col2, col3), dim=1)
+
+    def fdF1(x0):
+        eps = 0.0001
+        eps0 = torch.tensor([eps, 0, 0]).to(device)
+        eps1 = torch.tensor([0, eps, 0]).to(device)
+        eps2 = torch.tensor([0, 0, eps]).to(device)
+
+        right = x(x0)
+        #left
+        xx = x0 + eps0
+        left = x(xx)
+        col1 = (left - right)/(eps)
+
+        xx = x0 + eps1
+        left = x(xx)
+        col2 = (left - right)/(eps)
+        
+        xx = x0 + eps2
+        left = x(xx)
+        col3 = (left - right)/(eps)
+        
+        # Create a PyTorch matrix from the columns
+        return torch.stack((col1, col2, col3), dim=1)
+
+
+
+
     pt_wise_Fs = torch.vmap(torch.func.jacrev(x), randomness="same")(X0)
+    # pt_wise_Fs = torch.vmap(fdF1, randomness="same")(X0)
     pt_wise_E = torch.vmap(elastic_energy, randomness="same")(pt_wise_Fs, mus, lams)
     totE = (np_object["ObjectVol"]/X0.shape[0])*pt_wise_E.sum()
     return totE
@@ -137,12 +191,18 @@ def penalty(X0, x0_flat, B, J, z):
         print("         PokeE: ", pokyE, barrier_T, torch.min(dist_to_poky))
     return totE + floorE + movE + pokyE# + collE
 
-def potential_energy(Phi, W, z, newx, Mg, X0, Faces, YMs,  x0_flat, J, B, Handles):  
+def potential_energy(Phi, W, z, newx, Mg, M, X0, Faces, YMs,  x0_flat, J, B, Handles):  
     pe = penalty(X0, x0_flat, B, J, z)
     T = z.reshape(-1, 3,4)
     le = Phi(X0, W, Faces, YMs, T, Handles) #E_pot(X0, T, Handles)
     ge = newx.T @ Mg
-    return le + ge + pe
+    we = torch.tensor([0]).to(device)
+    if "Wind_code" in scene:
+        l_dict = {"dt":dt, "simulation_iteration": simulation_iteration}
+        exec(scene["Wind_code"], globals(), l_dict)
+        wind_force = l_dict["wind_force"]
+        we = newx.T@ M @wind_force.repeat(X0.shape[0]).float()
+    return le + ge + pe + we
 
 def line_search(func, x, direction, gradient, alpha=0.5, beta=0.5):
     t = 10.0  # Initial step size
@@ -304,7 +364,7 @@ def simulate(np_X, Faces, np_YMs, np_PRs, np_Rho, WW, Phi, Handles):
 
                 def partial_newton_E(z): 
                     newx = B@z + x0_flat
-                    PE = potential_energy(Phi,W, z, newx, Mg, X0, tFaces, tYMs, x0_flat, J, B, Handles)
+                    PE = potential_energy(Phi,W, z, newx, Mg, M, X0, tFaces, tYMs, x0_flat, J, B, Handles)
                     return 0.5*z.T@BJMJB@z - z.T@BJMJB@ z_prev - dt*z.T@BJMJB@ z_dot + dt*dt*PE
 
                 
@@ -372,11 +432,14 @@ def simulate(np_X, Faces, np_YMs, np_PRs, np_Rho, WW, Phi, Handles):
     return states, X0.cpu().detach(), W.detach()
 
 random_batch_indices = np.random.randint(0, np_object["ObjectSamplePts"].shape[0], size=int(scene["NumCubaturePts"])) 
+
+YMmult = scene["SimplicitObjects"][0]["YM_multiplier"] if "YM_multiplier" in scene["SimplicitObjects"][0] else 1
+Rhomult = scene["SimplicitObjects"][0]["Rho_multiplier"] if "Rho_multiplier" in scene["SimplicitObjects"][0] else 1
 np_V = None #np_object["surfV"][:, 0:3]
 np_F = 0 #np_object["surfF"]
 np_X = np_object["ObjectSamplePts"][:, 0:3][random_batch_indices, :]
-np_YMs = np_object["ObjectYMs"][random_batch_indices, np.newaxis]
-np_Rho = np_object["ObjectRho"][random_batch_indices, np.newaxis]
+np_YMs = np_object["ObjectYMs"][random_batch_indices, np.newaxis] * YMmult
+np_Rho = np_object["ObjectRho"][random_batch_indices, np.newaxis] * Rhomult
 np_PRs = np_object["ObjectPRs"][random_batch_indices, np.newaxis]
 torch.save(np_X, name_and_training_dir+"/" + scene_name + "-sim_X0")
 torch.save(np_YMs, name_and_training_dir+"/" + scene_name + "-sim_W")

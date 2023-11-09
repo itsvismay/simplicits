@@ -33,8 +33,8 @@ with open(fname+"-training-settings.json", 'r') as openfile:
 np_object = torch.load(fname+"-object")
 scene = json.loads(open(name_and_training_dir + "/../"+str(args[2])+".json", "r").read())
 
-
-loaded_Handles = torch.load(object_name+"/"+training_name+"-training" + "/Handles_post",  map_location=torch.device(device))
+use_handle_its = scene["HandleIts"] if "HandleIts" in scene else ""
+loaded_Handles = torch.load(object_name+"/"+training_name+"-training" + "/Handles_post"+use_handle_its,  map_location=torch.device(device))
 
 for nnnn, pppp in loaded_Handles.model.named_parameters():
     print(nnnn, pppp.size())
@@ -164,9 +164,9 @@ if "1" in args[3]:
     V0 = torch.tensor(np_object["SurfV"], dtype=torch.float32)
     loaded_F = np_object["SurfF"]
     computed_W_V = torch.cat((loaded_Handles.getAllWeightsSoftmax(V0), torch.ones(V0.shape[0], 1)), dim=1)
-    loaded_ym = np_object["SurfYM"]
+    loaded_ym = np_object["SurfYM"] if "SurfYM" in np_object else None
     if loaded_ym == None:
-        loaded_ym = np.ones(np_object["surfV"].shape[0])
+        loaded_ym = np.ones(np_object["SurfV"].shape[0])
     rgb_values = scalar_to_rgb(loaded_ym, "white", "black")
     for i in range(len(loaded_states)):
         print(i)

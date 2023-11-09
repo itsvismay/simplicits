@@ -499,7 +499,7 @@ def generate_from_sdf(name, yms = 1e4, prs = 0.45, rhos = 1000, surf = False, pt
     plot_implicit(np_O, np_O_sdfval)
     if surf:
         # 3. Marching cubes to recreate the surface mesh from sdf
-        voxel_grid, voxel_pts, voxel_sdf = voxelize_point_cloud(uniform_points, 0.1, fcn, sdf_vals)
+        voxel_grid, voxel_pts, voxel_sdf = voxelize_point_cloud(uniform_points, 0.5, fcn, sdf_vals)
         tempV, surfF, normals, other = skimage.measure.marching_cubes(voxel_grid, level=0)
         interior_voxel_pts = voxel_pts[np.nonzero(voxel_sdf<=0)[0], :]
         surfV = rescale_and_recenter(tempV, np.min(interior_voxel_pts, axis=0), np.max(interior_voxel_pts, axis=0))
@@ -1016,7 +1016,7 @@ def generate_sdf_small_box(sim_obj_name):
 def generate_sdf_large_box(sim_obj_name):
     #Trained on np_object = generate_from_sdf("BigBox", yms=1e4, prs = 0.45, rhos = 1000, surf = False)
 
-    np_object = generate_from_sdf("BigBox", yms=1e5, prs = 0.45, rhos = 100, surf = False)
+    np_object = generate_from_sdf("BigBox", yms=1e3, prs = 0.45, rhos = 100, surf = True)
 
     training_dict = getDefaultTrainingSettings()
     training_dict["TSamplingStdev"] = 0.1
@@ -1232,12 +1232,12 @@ def generate_nerf_iron(sim_obj_name):
 
 # Generate SDF objects
 # generate_sdf_simple_skullbrain("SDF_SimpleSkullBrain")
-# generate_sdf_large_box("SDF_LargeBox") # needs smaller deformation sample size
+generate_sdf_large_box("SDF_LargeBox_1e3ym") # needs smaller deformation sample size
 # generate_sdf_ribbon("SDF_Ribbon") # needs more its and smaller start/end LR
 # generate_sdf_mandelbulb("SDF_Mandelbulb")
 
 # Generate Mesh objects
-generate_mesh_511beam("Mesh_511BeamELU1000Density")
+# generate_mesh_511beam("Mesh_511BeamELU1000Density")
 # generate_mesh_beam("Mesh_BeamELU")
 
 # Needs work

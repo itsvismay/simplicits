@@ -60,7 +60,9 @@ plt.plot(ma)
 plt.title('Loss curve')
 plt.xlabel('Iterations')
 plt.ylabel('Loss')
+# plt.savefig(training_name)
 plt.show()
+
 
 if timings is not None:
     # Compute the moving average
