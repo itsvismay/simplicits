@@ -488,7 +488,7 @@ class HandleModels():
         self.layer_width = layer_width
         self.activation_func = activation_func
         self.lr_start = lr_start
-        
+        print("Using activation:",activation_func)
         if activation_func == "ELU":
             self.model = StrandleWeightsMLP(input_dim = dim, 
                                             hidden_dim = layer_width, 
@@ -503,7 +503,6 @@ class HandleModels():
                                 num_layers = num_layers,                    # number of layers
                                 w0_initial = 0.3                   # different signals may require different omega_0 in the first layer - this is a hyperparameter
                             )
-            exit()
         else:
             print("uknown activation function")
             exit()        

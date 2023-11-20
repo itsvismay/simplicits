@@ -36,8 +36,8 @@ Handles_pre.eval()
 
 t_O = torch.tensor(np_object["ObjectSamplePts"][:,0:3]).to(device)
 
-# for nnnn, pppp in Handles_post.model.named_parameters():
-#     print(nnnn, pppp.size())
+for nnnn, pppp in Handles_post.model.named_parameters():
+    print(nnnn, pppp.size())
 
 # np_W0, np_X0, np_G0 = test(Handles_post, t_O, int(t_O.shape[0]/10))
 # plot_handle_regions(np_X0, np_W0, "Pre Training Handle Weights")
