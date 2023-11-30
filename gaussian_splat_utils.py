@@ -248,7 +248,7 @@ def convert_gs_camera(gs_camera):
 
 
 class GaussianSplatsRendererSetup:
-    def __init__(self, gaussians, kal_cam,
+    def __init__(self, gaussians, kal_cam, world_up_axis='y', max_fps=12,
                  log_scale=True, log_opacity=False, timeline=None):
         self.gaussians = gaussians
         self.pipeline = PipelineParamsNoparse()
@@ -416,7 +416,7 @@ class GaussianSplatsRendererSetup:
 
             cam = convert_kaolin_camera(kaolin_cam)
             render_res = render(cam, tmp_gaussians, self.pipeline, self.background)
-            rendering = render_res["render"]
+            rendering = torch.clamp(render_res["render"], 0.0, 1.0)
             return (rendering.permute(1, 2, 0) * 255).to(torch.uint8).detach().cpu()
 
         def handle_slider(e):
@@ -426,9 +426,10 @@ class GaussianSplatsRendererSetup:
 
         # Instantiate visualizer with this custom render function
         focus_at = (kal_cam.cam_pos() - 4. * kal_cam.extrinsics.cam_forward()).squeeze()
+        world_up_axis_idx = 2 if world_up_axis.lower() == 'z' else 0 if world_up_axis.lower() == 'x' else 1
         self.visualizer = kaolin.visualize.IpyTurntableVisualizer(
             512, 512, copy.deepcopy(kal_cam), selective_render_kaolin,
-            focus_at=focus_at, world_up_axis=2, max_fps=12)
+            focus_at=focus_at, world_up_axis=world_up_axis_idx, max_fps=max_fps)
         self.visualizer.render_update()
 
         scaling_slider.observe(handle_slider, names='value')
