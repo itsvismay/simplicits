@@ -13,12 +13,140 @@ import os
 import json
 from thirdparty.gausplat.utils.graphics_utils import focal2fov
 from thirdparty.gausplat.utils.system_utils import searchForMaxIteration
+from thirdparty.gausplat.utils.general_utils import strip_symmetric, build_scaling_rotation
 from thirdparty.gausplat.gaussian_renderer import render, GaussianModel
 from thirdparty.gausplat.scene.cameras import Camera as GSCamera
+
 try:
     from ipywidgets import Layout
 except Exception as e:
     print('WARNING: Could not import ipywidgets, please reinstall it with pip or renderer will not appear correctly.')
+
+
+def deformation_gradient(x0, handles_model, transforms):
+    def x(x0):
+        x0_i = x0.unsqueeze(0)
+        x03 = torch.cat((x0_i, torch.tensor([[1]], device=x0.device)), dim=1)
+        t_W = torch.cat((handles_model.getAllWeightsSoftmax(x0_i), torch.tensor([[1]]).to(x0.device)), dim=1).T
+
+        def inner_over_handles(T, w):
+            return w * T @ x03.T
+
+        wTx03s = torch.vmap(inner_over_handles)(transforms, t_W)
+        x_i = torch.sum(wTx03s, dim=0)
+        return x_i.T + x0_i
+    return torch.vmap(torch.func.jacrev(x), randomness="same")(x0).squeeze(1)
+
+# def deformation_gradient(x0, handles_model, transforms):
+#     def _deformation_gradient(x0):
+#         """ Maps points x0 -> X """
+#         device = x0.device
+#         num_handles = transforms.shape[0]
+#
+#         # (1, 4)
+#         x0_i = x0[None]
+#         x0_homogeneous = torch.cat((x0_i, torch.ones([1, 1], device=device)), dim=1)
+#         # (N, H, 4, 1)
+#         x0_homogeneous_expanded = x0_homogeneous[:, None, :, None].expand(num_gaussians, num_handles, 4, 1)
+#         # (N, H, 3, 4)
+#         transforms_expanded = transforms[None].expand(num_gaussians, num_handles, 3, 4)
+#         # (N, H)        ; N ~ number of gaussians, H ~ number of handles
+#         homg_dim = torch.ones(x0.shape[0], 1, device=x0.device, dtype=x0.dtype)
+#         weights = torch.cat((handles_model.getAllWeightsSoftmax(x0), homg_dim), dim=1)
+#         # (N, H, 3, 1)
+#         weights_expanded = weights[:, :, None, None].expand(num_gaussians, num_handles, 3, 1)
+#         # (N, H, 3, 1)
+#         xt = weights_expanded * (transforms_expanded @ x0_homogeneous_expanded)
+#         # (N, 3)
+#         xt = xt.squeeze(-1).sum(dim=1)
+#         X = xt + x0  # TODO (operel): should we add..? should we average..?
+#         return X
+#     return torch.func.vmap(torch.func.jacrev(_deformation_gradient), x0)
+
+
+class TransformableGaussianModel(GaussianModel):
+    def __init__(self, handles_model, sh_degree : int):
+        super().__init__(sh_degree=sh_degree)
+
+        device = self._xyz.device
+        self.keyframe = 0
+        self.handles_model = handles_model
+        self.handles_model.to_device(device)
+        self.transforms = None      # torch.Tensor of (T, H, 3, 4)  ; T ~ number of timeframes, H ~ number of handles
+
+    def get_weights(self):
+        # (N, H) ; N ~ number of gaussians, H ~ number of handles
+        # representing the weight each handle assigns to each point at rest frame
+        x0 = super().get_xyz
+        homg_dim = torch.ones(x0.shape[0], 1, device=x0.device, dtype=x0.dtype)
+        self.handles_model.to_device(x0.device)
+        weights = torch.cat((self.handles_model.getAllWeightsSoftmax(x0), homg_dim), dim=1)
+        return weights
+
+    def map(self, x0):
+        """ Maps points x0 -> X """
+        transforms = self.transforms[self.keyframe]
+        device = x0.device
+        num_gaussians = x0.shape[0]
+        num_handles = transforms.shape[0]
+
+        # (N, 4)
+        x0_homogeneous = torch.cat((x0, torch.ones([num_gaussians, 1], device=device)), dim=1)
+        # (N, H, 4, 1)
+        x0_homogeneous_expanded = x0_homogeneous[:, None, :, None].expand(num_gaussians, num_handles, 4, 1)
+        # (N, H, 3, 4)
+        transforms_expanded = transforms[None].expand(num_gaussians, num_handles, 3, 4)
+        # (N, H)        ; N ~ number of gaussians, H ~ number of handles
+        weights = self.get_weights()
+        # (N, H, 3, 1)
+        weights_expanded = weights[:, :, None, None].expand(num_gaussians, num_handles, 3, 1)
+        # (N, H, 3, 1)
+        xt = weights_expanded * (transforms_expanded @ x0_homogeneous_expanded)
+        # (N, 3)
+        xt = xt.squeeze(-1).sum(dim=1)
+        X = xt + x0  # TODO (operel): should we add..? should we average..?
+        return X
+
+    @property
+    def get_xyz(self):
+        x0 = super().get_xyz
+        if self.keyframe == 0 or self.transforms is None:
+            return x0
+        else:
+            return self.map(x0)
+
+    def get_covariance(self, scaling_modifier = 1):
+        device = self._xyz.device
+        num_gaussians = self._xyz.shape[0]
+        L = build_scaling_rotation(scaling_modifier * self.get_scaling, self._rotation)
+        if self.keyframe == 0 or self.transforms is None:
+            actual_covariance = L @ L.transpose(1, 2)
+        else:
+            # transforms = self.transforms[self.keyframe]
+            # deformation gradient
+            x0 = self._xyz
+            F = deformation_gradient(x0, self.handles_model, self.transforms[self.keyframe])
+
+            # num_gaussians = L.shape[0]
+            # num_handles = transforms.shape[0]
+            # (N, H, 3, 3)
+            # transforms_expanded = transforms[None].expand(num_gaussians, num_handles, 3, 4)
+            # transforms_expanded = transforms_expanded[:, :, :, :3]
+            # (N, H)        ; N ~ number of gaussians, H ~ number of handles
+            # weights = self.get_weights()
+            # (N, H, 3, 1)
+            # weights_expanded = weights[:, :, None, None].expand(num_gaussians, num_handles, 3, 1)
+            # (N, H, 3, 3)
+            # L_expanded = L[:, None].expand(num_gaussians, num_handles, 3, 3)
+            # (N, H, 3, 3)
+            # transformed_L = weights_expanded * transforms_expanded @ L_expanded
+            # (N, 3, 3)
+            # transformed_L = transformed_L.sum(dim=1)
+            transformed_L = F @ L
+            actual_covariance = transformed_L @ transformed_L.transpose(1, 2)
+        symm = strip_symmetric(actual_covariance)
+
+        return symm
 
 
 class PipelineParamsNoparse:
@@ -26,11 +154,11 @@ class PipelineParamsNoparse:
 
     def __init__(self):
         self.convert_SHs_python = False
-        self.compute_cov3D_python = False
+        self.compute_cov3D_python = True
         self.debug = False
 
 
-def load_checkpoint(model_path, sh_degree=3, iteration=-1):
+def load_checkpoint(model_path, handles_model=None, sh_degree=3, iteration=-1):
     # Find checkpoint
     checkpt_dir = os.path.join(model_path, "point_cloud")
     if iteration == -1:
@@ -38,7 +166,10 @@ def load_checkpoint(model_path, sh_degree=3, iteration=-1):
     checkpt_path = os.path.join(checkpt_dir, f"iteration_{iteration}", "point_cloud.ply")
 
     # Load guassians
-    gaussians = GaussianModel(sh_degree)
+    if handles_model is not None:
+        gaussians = TransformableGaussianModel(handles_model, sh_degree)
+    else:
+        gaussians = GaussianModel(sh_degree)
     gaussians.load_ply(checkpt_path)
     return gaussians
 
