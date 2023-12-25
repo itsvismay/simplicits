@@ -419,6 +419,15 @@ class GaussianSplatsRendererSetup:
             rendering = torch.clamp(render_res["render"], 0.0, 1.0)
             return (rendering.permute(1, 2, 0) * 255).to(torch.uint8).detach().cpu()
 
+        def fast_selective_render_kaolin(kaolin_cam):
+            width, height = kaolin_cam.width, kaolin_cam.height
+            kaolin_cam.width //= 16
+            kaolin_cam.height //= 16
+            renderbuffer = selective_render_kaolin(kaolin_cam)
+            kaolin_cam.width = width
+            kaolin_cam.height = height
+            return renderbuffer
+
         def handle_slider(e):
             self.visualizer.out.clear_output()
             with self.visualizer.out:
@@ -428,8 +437,14 @@ class GaussianSplatsRendererSetup:
         focus_at = (kal_cam.cam_pos() - 4. * kal_cam.extrinsics.cam_forward()).squeeze()
         world_up_axis_idx = 2 if world_up_axis.lower() == 'z' else 0 if world_up_axis.lower() == 'x' else 1
         self.visualizer = kaolin.visualize.IpyTurntableVisualizer(
-            512, 512, copy.deepcopy(kal_cam), selective_render_kaolin,
-            focus_at=focus_at, world_up_axis=world_up_axis_idx, max_fps=max_fps)
+            height=512, width=512,
+            camera=copy.deepcopy(kal_cam),
+            render=selective_render_kaolin,
+            fast_render=fast_selective_render_kaolin,
+            focus_at=focus_at,
+            world_up_axis=world_up_axis_idx,
+            max_fps=max_fps
+        )
         self.visualizer.render_update()
 
         scaling_slider.observe(handle_slider, names='value')
