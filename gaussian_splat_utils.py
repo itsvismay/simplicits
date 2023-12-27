@@ -11,6 +11,7 @@ import torch
 import torchvision
 import os
 import json
+from functools import lru_cache
 from thirdparty.gausplat.utils.graphics_utils import focal2fov
 from thirdparty.gausplat.utils.system_utils import searchForMaxIteration
 from thirdparty.gausplat.utils.general_utils import strip_symmetric, build_scaling_rotation
@@ -73,6 +74,8 @@ class TransformableGaussianModel(GaussianModel):
         self.handles_model = handles_model
         self.handles_model.to_device(device)
         self.transforms = None      # torch.Tensor of (T, H, 3, 4)  ; T ~ number of timeframes, H ~ number of handles
+        self.x0 = None              # keeps a copy of the non-deformed positions
+        self.cov_t = None           # Cache cov at timestep t for better FPS
 
     def get_weights(self):
         # (N, H) ; N ~ number of gaussians, H ~ number of handles
@@ -83,9 +86,10 @@ class TransformableGaussianModel(GaussianModel):
         weights = torch.cat((self.handles_model.getAllWeightsSoftmax(x0), homg_dim), dim=1)
         return weights
 
-    def map(self, x0):
+    @lru_cache(maxsize=1)
+    def map_pos(self, x0, keyframe):
         """ Maps points x0 -> X """
-        transforms = self.transforms[self.keyframe]
+        transforms = self.transforms[keyframe]
         device = x0.device
         num_gaussians = x0.shape[0]
         num_handles = transforms.shape[0]
@@ -107,46 +111,78 @@ class TransformableGaussianModel(GaussianModel):
         X = xt + x0  # TODO (operel): should we add..? should we average..?
         return X
 
-    @property
-    def get_xyz(self):
-        x0 = super().get_xyz
-        if self.keyframe == 0 or self.transforms is None:
-            return x0
-        else:
-            return self.map(x0)
-
-    def get_covariance(self, scaling_modifier = 1):
-        device = self._xyz.device
-        num_gaussians = self._xyz.shape[0]
+    def map_cov(self, scaling_modifier = 1):
         L = build_scaling_rotation(scaling_modifier * self.get_scaling, self._rotation)
         if self.keyframe == 0 or self.transforms is None:
             actual_covariance = L @ L.transpose(1, 2)
         else:
-            # transforms = self.transforms[self.keyframe]
             # deformation gradient
             x0 = self._xyz
             F = deformation_gradient(x0, self.handles_model, self.transforms[self.keyframe])
-
-            # num_gaussians = L.shape[0]
-            # num_handles = transforms.shape[0]
-            # (N, H, 3, 3)
-            # transforms_expanded = transforms[None].expand(num_gaussians, num_handles, 3, 4)
-            # transforms_expanded = transforms_expanded[:, :, :, :3]
-            # (N, H)        ; N ~ number of gaussians, H ~ number of handles
-            # weights = self.get_weights()
-            # (N, H, 3, 1)
-            # weights_expanded = weights[:, :, None, None].expand(num_gaussians, num_handles, 3, 1)
-            # (N, H, 3, 3)
-            # L_expanded = L[:, None].expand(num_gaussians, num_handles, 3, 3)
-            # (N, H, 3, 3)
-            # transformed_L = weights_expanded * transforms_expanded @ L_expanded
-            # (N, 3, 3)
-            # transformed_L = transformed_L.sum(dim=1)
             transformed_L = F @ L
             actual_covariance = transformed_L @ transformed_L.transpose(1, 2)
         symm = strip_symmetric(actual_covariance)
-
         return symm
+
+    def set_timestep(self, keyframe):
+        if keyframe != self.keyframe:
+            self.keyframe = keyframe
+            self._xyz = self.x0.to(self._xyz.device)
+            if self.keyframe > 0 and self.transforms is not None:
+                self._xyz = self.map_pos(self._xyz, keyframe=self.keyframe)
+                self.cov_t = self.map_cov()
+
+    def get_covariance(self, scaling_modifier=1):
+        if self.cov_t is None:
+            return super().get_covariance(scaling_modifier)
+        else:
+            return self.cov_t
+
+
+    # @property
+    # def get_xyz(self):
+    #     x0 = super().get_xyz
+    #     if self.keyframe == 0 or self.transforms is None:
+    #         return x0
+    #     else:
+    #         return self.map(x0, keyframe=self.keyframe)
+
+    # def get_covariance(self, scaling_modifier = 1):
+    #     device = self._xyz.device
+    #     num_gaussians = self._xyz.shape[0]
+    #     L = build_scaling_rotation(scaling_modifier * self.get_scaling, self._rotation)
+    #     if self.keyframe == 0 or self.transforms is None:
+    #         actual_covariance = L @ L.transpose(1, 2)
+    #     else:
+    #         # transforms = self.transforms[self.keyframe]
+    #         # deformation gradient
+    #         x0 = self._xyz
+    #         F = deformation_gradient(x0, self.handles_model, self.transforms[self.keyframe])
+    #
+    #         # num_gaussians = L.shape[0]
+    #         # num_handles = transforms.shape[0]
+    #         # (N, H, 3, 3)
+    #         # transforms_expanded = transforms[None].expand(num_gaussians, num_handles, 3, 4)
+    #         # transforms_expanded = transforms_expanded[:, :, :, :3]
+    #         # (N, H)        ; N ~ number of gaussians, H ~ number of handles
+    #         # weights = self.get_weights()
+    #         # (N, H, 3, 1)
+    #         # weights_expanded = weights[:, :, None, None].expand(num_gaussians, num_handles, 3, 1)
+    #         # (N, H, 3, 3)
+    #         # L_expanded = L[:, None].expand(num_gaussians, num_handles, 3, 3)
+    #         # (N, H, 3, 3)
+    #         # transformed_L = weights_expanded * transforms_expanded @ L_expanded
+    #         # (N, 3, 3)
+    #         # transformed_L = transformed_L.sum(dim=1)
+    #         transformed_L = F @ L
+    #         actual_covariance = transformed_L @ transformed_L.transpose(1, 2)
+    #     symm = strip_symmetric(actual_covariance)
+    #
+    #     return symm
+
+    @property
+    def num_keyframes(self):
+        return self.transforms.shape[0]
 
 
 class PipelineParamsNoparse:

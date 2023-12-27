@@ -3,31 +3,47 @@ import torch.nn as nn
 import torch.nn.functional as F
 import random, os, sys
 from SimplicitHelpers import *
+from typing import Dict
 import json
 
 
 class Trainer:
 
-    def __init__(self, object_name, training_name):
+    def __init__(self,
+        object_name: str,
+        training_name: str,
+        np_object: Dict = None,
+        training_settings: Dict = None,
+        Handles_post = None,
+        Handles_pre = None,
+    ):
         # Get cpu or gpu device for training.
         device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
         self.device = device
         print(f"Using {device} device")
 
-        # Read in the object (hardcoded for now)
-        fname = object_name + "/" + object_name
-        self.np_object = torch.load(fname + "-object")
-
-        # Opening JSON file with training settings
-        with open(fname + "-training-settings.json", 'r') as openfile:
-            self.training_settings = json.load(openfile)
-
         self.name_and_training_dir = object_name + "/" + training_name + "-training"
 
-        self.Handles_post = torch.load(self.name_and_training_dir + "/Handles_post")
-        self.Handles_pre = torch.load(self.name_and_training_dir + "/Handles_pre")
+        # Read in the object (hardcoded for now)
+        fname = object_name + "/" + object_name
+        if np_object is None:
+            np_object = torch.load(fname + "-object")
+        self.np_object = np_object
 
+        if training_settings is None:
+            # Opening JSON file with training settings
+            with open(fname + "-training-settings.json", 'r') as openfile:
+                training_settings = json.load(openfile)
+        self.training_settings = training_settings
+
+        if Handles_post is None:
+            Handles_post = torch.load(self.name_and_training_dir + "/Handles_post")
+        self.Handles_post = Handles_post
         self.Handles_post.to_device(device)
+
+        if Handles_pre is None:
+            Handles_pre = torch.load(self.name_and_training_dir + "/Handles_pre")
+        self.Handles_pre = Handles_pre
 
         self.t_O = torch.tensor(self.np_object["ObjectSamplePts"][:, 0:3]).to(device)
         self.t_YMs = torch.tensor(self.np_object["ObjectYMs"]).unsqueeze(-1).to(device)

@@ -11,6 +11,7 @@ from typing import Tuple, Dict, Union
 from dataclasses import dataclass
 from thirdparty.gausplat.gaussian_renderer import render, GaussianModel
 from thirdparty.gausplat.scene.cameras import Camera as GSCamera
+from gaussian_splat_utils import TransformableGaussianModel
 
 DEFAULT_DEVICE = torch.device('cuda')
 MAX_DEPTH = 10.0  # arbitrary, used for colormap range of depth channel
@@ -520,6 +521,9 @@ class GUI:
         # Holds the info of the currently existing selection in the gui
         self.current_selection: GSplatSelection = GSplatSelection()
 
+        # Drives the dynamics training and simulation, only initialized upon request
+        self.simplicits_simulator: SimplicitsSimulator = None
+
         # Update once to popualate lazily-created structures
         self.update_render_view_viz(force=True)
 
@@ -753,7 +757,8 @@ class GUI:
         elif style in ("alpha", "depth"):
             self.viz_render_scalar_buffer.update_data_from_device(rb.detach())
 
-        ps.frame_tick()
+        with torch.enable_grad():
+            ps.frame_tick()
 
     def populate_rolling_buffers(self):
         self.ps_point_cloud.add_scalar_quantity("rolling_error", to_np(self.model.rolling_error[:,0]))
@@ -834,12 +839,12 @@ class GUI:
                     segments = self.init_segments()
                     self.segments.update(segments)
                     self.current_selection = GSplatSelection()
-                if psim.MenuItem("Save", "Ctrl+S"):
+                if psim.MenuItem("Save Segments", "Ctrl+S"):
                     filename = f'{self.get_model_id()}_segments.pt'
                     torch.save(self.segments, filename)
                     ps.warning(f"Saved segments state to: {os.getcwd()}{os.path.sep}{filename}")
                 psim.MenuItem("Save As..", enabled=False)
-                if psim.MenuItem("Load", "Ctrl+L"):
+                if psim.MenuItem("Load Segments", "Ctrl+L"):
                     filename = f'{self.get_model_id()}_segments.pt'
                     try:
                         segments = torch.load(filename)
@@ -855,19 +860,61 @@ class GUI:
                 psim.MenuItem("Redo", "Ctrl+Shift+Z", enabled=False)
                 psim.EndMenu()
             if psim.BeginMenu("Run"):
-                if psim.MenuItem("Train Simulation", "Ctrl+1"):
-                    self.run_algorithm()
-                psim.MenuItem("Stage Forces..", "Ctrl+2")
-                psim.MenuItem("Simulate Dynamics", "Ctrl+3")
+                if psim.MenuItem("Setup New Simulation", "Ctrl+1"):
+                    self.setup_new_simulation()
+                if psim.MenuItem("Load Previous Handles Setup", "Ctrl+2"):
+                    self.load_existing_simulation_setup()
+                if psim.MenuItem("Train Handles Simulation", "Ctrl+3", enabled=self.simplicits_simulator is not None):
+                    self.simplicits_simulator.run_training()
+                psim.MenuItem("Stage Forces..", "Ctrl+4", enabled=self.simplicits_simulator is not None)
+                if psim.MenuItem("Simulate Dynamics", "Ctrl+5", enabled=self.simplicits_simulator is not None):
+                    self.model = self.simplicits_simulator.simulate_scene('poke_z')
+                    self.prune_redundant_gaussians()    # TODO (operel): Hacky way around out of mem
+                    self.simplicits_simulator.cfg.model = self.model
+                if psim.MenuItem("Load Previous Dynamics", "Ctrl+6", enabled=self.simplicits_simulator is not None):
+                    self.model = self.simplicits_simulator.load_simulated_scene('poke_z')
+                    self.prune_redundant_gaussians()    # TODO (operel): Hacky way around out of mem
+                    self.simplicits_simulator.cfg.model = self.model
                 psim.EndMenu()
             psim.EndMainMenuBar()
 
+    def prune_redundant_gaussians(self, threshold = 0.35):
+        """ To save mem """
+        opacity_mask = self.model.get_opacity[:, 0] >= threshold
+        self.model._xyz = self.model._xyz[opacity_mask]
+        self.model._features_dc = self.model._features_dc[opacity_mask]
+        self.model._features_rest = self.model._features_rest[opacity_mask]
+        self.model._scaling = self.model._scaling[opacity_mask]
+        self.model._rotation = self.model._rotation[opacity_mask]
+        self.model._opacity = self.model._opacity[opacity_mask]
+
+        if isinstance(self.model, TransformableGaussianModel):
+            self.model.x0 = self.model.x0[opacity_mask.to(self.model.x0.device)]
+
+        for segment in self.segments.values():
+            segment.mask = segment.mask[opacity_mask]
+
+        if self.current_selection is not None and self.current_selection.mask is not None:
+            self.current_selection.mask = self.current_selection.mask[opacity_mask]
+
+        self.preview_buffers = {buffer_name: buffer[opacity_mask]
+                                for buffer_name, buffer in self.preview_buffers.items()}
+
+
+    @torch.no_grad()
     def ps_ui_callback(self):
         self.draw_main_menu()
 
         # If modal dialog is open avoid the rest of the logic
         if self.new_segment_dialog.show_dialog():
             return
+
+        if self.model is not None and isinstance(self.model, TransformableGaussianModel):
+            psim.SetNextItemOpen(True, psim.ImGuiCond_FirstUseEver)
+            if psim.TreeNode("Animation"):
+                _, keyframe = psim.SliderInt("Timestep", self.model.keyframe, 0, self.model.num_keyframes)
+                self.model.set_timestep(keyframe)
+                psim.TreePop()
 
         psim.SetNextItemOpen(True, psim.ImGuiCond_FirstUseEver)
         if psim.TreeNode("Training"):
@@ -938,25 +985,25 @@ class GUI:
 
 ##########
 
-    def run_algorithm(self, segment: Segment=None):
-
+    def setup_new_simulation(self, segment: Segment=None):
         sim_config = SimulationConfig(
             object_name=self.conf.object_name,
             segments=segment if segment is not None else self.segments,
-            model=self.model
+            model=self.model,
+            new_training=True
         )
-        segment_name = f"-{sim_config.segments.name}" if isinstance(sim_config.segments, Segment) else ""
-        training_id = f"-{sim_config.training_id}"
-        sim_config.training_name = f"{sim_config.object_name}-training{segment_name}{training_id}"
+        self.simplicits_simulator = SimplicitsSimulator(sim_config)
+        print(f"Creating new simulation setup for object {self.conf.object_name}")
 
-        # Step 1
-        np_object = initialize_sim_object(sim_config)
-        training_settings = initialize_sim_training(sim_config, np_object)
-        # Step 2
-        training_settings, Handles_post, Handles_pre = setup_training(sim_config, np_object, training_settings)
-        # Step 3
-        Handles_post, Handles_pre = run_training(sim_config, np_object, training_settings, Handles_post)
-
+    def load_existing_simulation_setup(self, segment: Segment=None):
+        sim_config = SimulationConfig(
+            object_name=self.conf.object_name,
+            segments=segment if segment is not None else self.segments,
+            model=self.model,
+            new_training=False
+        )
+        self.simplicits_simulator = SimplicitsSimulator(sim_config)
+        print(f"Loading existing simulation setup for object {self.conf.object_name}")
 
 
 @dataclass
@@ -967,256 +1014,368 @@ class SimulationConfig:
     object_name: str = ""                     # Object name
     segments: Union[Segment, Dict] = None
     model: GaussianModel = None
+    new_training: bool = False                # If False, will try to load previous training, else start new training
 
     training_id: str = ""                     # Identifier for this dynamics training session
-    training_num_skinning_handles: int = 40,  # Number of skinning handles
-    training_num_steps: int = 30000,          # Training steps
-    training_num_sample_pts: int  = 1000,     # Sampled pts during training
-    training_LRStart: float = 1e-3,           # LR scheduling
-    training_LREnd: float = 1e-4,             # LR scheduling end (linear scheduling)
+    training_num_skinning_handles: int = 40   # Number of skinning handles
+    training_num_steps: int = 30000           # Training steps
+    training_num_sample_pts: int  = 1000      # Sampled pts during training
+    training_LRStart: float = 1e-3            # LR scheduling
+    training_LREnd: float = 1e-4              # LR scheduling end (linear scheduling)
     training_TSamplingStdev: float = 1        # Magnitude of random deformations:
                                               #  magnitude of deformation applied per handle
     # batch_size = 10                           # Number of deformations batched at the same time
 
-# Step 1a
-def initialize_sim_object(sim_config: SimulationConfig) -> Dict:
-    """
-    segment: If specified, runs simulation on isolated segment, else uses all segments
-    """
-    model = sim_config.model
-    if isinstance(sim_config.segments, Segment):
-        segment = sim_config.segments
-        N = segment.mask.sum()
-        gs_pos = model.get_xyz()[segment.mask]
-        gs_rgb = model._features_dc()[segment.mask]
-        gs_YMs = torch.full(N, segment.attributes["Young's Modulus"])
-        gs_PRs = torch.full(N, segment.attributes["Poisson Ratio"])
-        gs_Rho = torch.full(N, segment.attributes["Rho"])
-    else:
-        gs_pos = model.get_xyz()
-        gs_rgb = model._features_dc()
-        N = gs_pos.shape[0]
-        gs_YMs, gs_PRs, gs_Rho = torch.ones(N), torch.ones(N), torch.ones(N)
-        for seg in sim_config.segments.values():
-            gs_YMs[seg.mask] = seg.attributes["Young's Modulus"]
-            gs_PRs[seg.mask] = seg.attributes["Poisson Ratio"]
-            gs_Rho[seg.mask] = seg.attributes["Rho"]
 
-    np_object = {
-        "Name": sim_config.object_name,
-        "Dim": 3,
-        "BoundingBoxSamplePts": None,
-        "BoundingBoxSignedDists": None,
-        "ObjectSamplePts": gs_pos.cpu().detach().numpy(),
-        "ObjectSampleColors": gs_rgb.cpu().detach().numpy(),
-        "ObjectYMs": gs_YMs.cpu().detach().numpy(),
-        "ObjectPRs": gs_PRs.cpu().detach().numpy(),
-        "ObjectRho": gs_Rho.cpu().detach().numpy(),
-        "ObjectColors": None,
-        "ObjectVol": 1,
-        "SurfV": None,
-        "SurfF": None,
-        "MarchingCubesRes": -1
-    }
+import json
+import random, os, sys
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from SetupObject_1 import getDefaultTrainingSettings
+from SimplicitHelpers import *
+from PhysicsSim import PhysicsSimulator
+from trainer import Trainer
 
-    return np_object
+class SimplicitsSimulator:
 
-# Step 1b
-def initialize_sim_training(sim_config: SimulationConfig, np_object: Dict):
-    import json
-    from SetupObject_1 import getDefaultTrainingSettings
+    def __init__(self, sim_config: SimulationConfig):
+        self.cfg = sim_config
+        object_name = self.cfg.object_name
+        training_name = self.training_name
 
-    training_dict = getDefaultTrainingSettings()
-    training_dict["NumHandles"] = sim_config.training_num_skinning_handles
-    training_dict["NumTrainingSteps"] = sim_config.training_num_steps
-    training_dict["NumSamplePts"] = sim_config.training_num_sample_pts
-    training_dict["LRStart"] = sim_config.training_LRStart
-    training_dict["LREnd"] = sim_config.training_LREnd
-    training_dict["TSamplingStdev"] = sim_config.training_TSamplingStdev
+        if self.cfg.new_training:
+            # Step 1
+            np_object = self.prepare_object_record()
+            training_settings = self.prepare_training_settings()
+            self._save_object_record(np_object, object_name)
+            self._save_training_settings(training_settings, object_name, training_name)
 
-    sim_obj_name = sim_config.object_name
-    if not os.path.exists(sim_obj_name):
-        os.makedirs(sim_obj_name)
-    torch.save(np_object, sim_obj_name + "/" + sim_obj_name + "-" + "object")
-    print(f'Object saved to: {os.getcwd() + "/" + sim_obj_name + "/" + sim_obj_name + "-" + "object"}')
+            # Step 2
+            Handles_post, Handles_pre = self.setup_model(np_object, training_settings)
+            self._save_model(Handles_post, object_name, training_name, "losses")
+            self._save_model(Handles_post, object_name, training_name, "Handles_post")
+            self._save_model(Handles_pre, object_name, training_name, "Handles_pre")
+        else:
+            np_object = self._load_object_record(object_name)
+            training_settings = self._load_training_settings(object_name, training_name)
+            Handles_post = self._load_model(object_name, training_name, "Handles_post")
+            Handles_pre = self._load_model(object_name, training_name, "Handles_pre")
 
-    if not os.path.exists(sim_obj_name + "/" + sim_obj_name + "-training-settings.json"):
-        json_object = json.dumps(training_dict, indent=4)
-        # Writing to sample.json
-        with open(sim_obj_name + "/" + sim_obj_name + "-training-settings.json", "w") as outfile:
-            outfile.write(json_object)
-    print(f'Training settings saved to: {os.getcwd() + "/" + sim_obj_name + "/" + sim_obj_name + "-training-settings.json"}')
-    return training_dict
+        self.np_object, self.training_settings = np_object, training_settings
+        self.Handles_post, self.Handles_pre = Handles_post, Handles_pre
 
-def setup_training(sim_config: SimulationConfig, np_object: Dict = None, training_settings: Dict = None):
-    import random, os, sys
-    from SimplicitHelpers import *
-    import json
+        self.physics_simulator = None
+        self.simulation_states = None
 
-    device = sim_config.device   # Get cpu or gpu device for training.
-    object_name = sim_config.object_name
-    training_name = sim_config.training_name
+        # TODO (@operel): (Should print architecture?)
+        # self.print_named_params(Handles_post)
+        # self.print_architecture(Handles_pre)
 
-    if np_object is None:
-        np_object = torch.load(f"{object_name}/{object_name}-object")
+        # t_O = torch.tensor(np_object["ObjectSamplePts"][:, 0:3]).to(device)
+        # np_W0, np_X0, np_G0 = test(Handles_post, t_O, int(t_O.shape[0] / 10))
+        # TODO (@operel): (visualize initial handles)
+        # plot_handle_regions(np_X0, np_W0, "Pre Training Handle Weights")
+        # TODO (@operel): (visualize initial YM - uniform for non-biological objects)
+        # plot_implicit(np_object["ObjectSamplePts"], np_object["ObjectYMs"] )
 
-    if training_settings is None:
-        # Open JSON file with training settings
-        with open(f"{object_name}/{object_name}-training-settings.json", 'r') as openfile:
-            training_settings = json.load(openfile)
+    # Step 1a
+    def prepare_object_record(self) -> Dict:
+        """
+        segment: If specified, runs simulation on isolated segment, else uses all segments
+        """
+        model = self.cfg.model
+        if isinstance(self.cfg.segments, Segment):
+            segment = self.cfg.segments
+            N = segment.mask.sum()
+            gs_pos = model.get_xyz[segment.mask]
+            gs_rgb = model._features_dc[segment.mask].squeeze(1)
+            gs_YMs = torch.full(N, segment.attributes["Young's Modulus"])
+            gs_PRs = torch.full(N, segment.attributes["Poisson Ratio"])
+            gs_Rho = torch.full(N, segment.attributes["Rho"])
+        else:
+            gs_pos = model.get_xyz
+            gs_rgb = model._features_dc.squeeze(1)
+            N = gs_pos.shape[0]
+            gs_YMs, gs_PRs, gs_Rho = torch.ones(N), torch.ones(N), torch.ones(N)
+            for seg in self.cfg.segments.values():
+                gs_YMs[seg.mask] = seg.attributes["Young's Modulus"]
+                gs_PRs[seg.mask] = seg.attributes["Poisson Ratio"]
+                gs_Rho[seg.mask] = seg.attributes["Rho"]
 
-    print(f"Using {device} device")
-    print(training_name)
+        np_object = {
+            "Name": self.cfg.object_name,
+            "Dim": 3,
+            "BoundingBoxSamplePts": None,
+            "BoundingBoxSignedDists": None,
+            "ObjectSamplePts": gs_pos.cpu().detach().numpy(),
+            "ObjectSampleColors": gs_rgb.cpu().detach().numpy(),
+            "ObjectYMs": gs_YMs.cpu().detach().numpy(),
+            "ObjectPRs": gs_PRs.cpu().detach().numpy(),
+            "ObjectRho": gs_Rho.cpu().detach().numpy(),
+            "ObjectColors": None,
+            "ObjectVol": 1,
+            "SurfV": None,
+            "SurfF": None,
+            "MarchingCubesRes": -1
+        }
+        return np_object
 
-    Handles_pre = HandleModels(training_settings["NumHandles"], training_settings["NumLayers"],
-                               training_settings["LayerWidth"], training_settings["ActivationFunc"], np_object["Dim"],
-                               training_settings["LRStart"])
-    Handles_post = HandleModels(training_settings["NumHandles"], training_settings["NumLayers"],
-                                training_settings["LayerWidth"], training_settings["ActivationFunc"], np_object["Dim"],
-                                training_settings["LRStart"])
+    # Step 1b
+    def prepare_training_settings(self):
+        training_dict = getDefaultTrainingSettings()
+        training_dict["NumHandles"] = self.cfg.training_num_skinning_handles
+        training_dict["NumTrainingSteps"] = self.cfg.training_num_steps
+        training_dict["NumSamplePts"] = self.cfg.training_num_sample_pts
+        training_dict["LRStart"] = self.cfg.training_LRStart
+        training_dict["LREnd"] = self.cfg.training_LREnd
+        training_dict["TSamplingStdev"] = self.cfg.training_TSamplingStdev
+        return training_dict
 
-    Handles_post.to_device(device)
-    Handles_pre.to_device(device)
-    Handles_pre.eval()
-
-    print('--List of learned params:--')
-    for nnnn, pppp in Handles_post.model.named_parameters():
-        print(nnnn, pppp.size())
-
-    print('--Architecture:--')
-    print(Handles_pre.__dict__)
-
-    t_O = torch.tensor(np_object["ObjectSamplePts"][:, 0:3]).to(device)
-    np_W0, np_X0, np_G0 = test(Handles_post, t_O, int(t_O.shape[0] / 10))
-    # TODO (vis initial handles)
-    # plot_handle_regions(np_X0, np_W0, "Pre Training Handle Weights")
-    # TODO (vis initial YM - uniform for non-biological objects)
-    # plot_implicit(np_object["ObjectSamplePts"], np_object["ObjectYMs"] )
-
-    print("Saving setup for " + object_name + "/" + training_name + "-training")
-    if not os.path.exists(object_name + "/" + training_name + "-training"):
-        os.makedirs(object_name + "/" + training_name + "-training")
-
-    # rewrite over training settings, and losses and handle state (final)
-    with open(object_name + "/" + training_name + "-training/training-settings.json", 'w', encoding='utf-8') as f:
-        json.dump(training_settings, f, ensure_ascii=False, indent=4)
-    torch.save(Handles_post, object_name + "/" + training_name + "-training" + "/losses")
-    torch.save(Handles_post, object_name + "/" + training_name + "-training" + "/Handles_post")
-    torch.save(Handles_pre, object_name + "/" + training_name + "-training" + "/Handles_pre")
-
-    print(
-        f'Training settings saved to: {os.getcwd() + "/" + object_name + "/" + training_name + "-training/training-settings.json"}')
-    print(f'Handles_post saved to: {os.getcwd() + "/" + object_name + "/" + training_name + "-training" + "/losses"}')
-    print(
-        f'Handles_post saved to: {os.getcwd() + "/" + object_name + "/" + training_name + "-training" + "/Handles_post"}')
-    print(
-        f'Handles_post saved to: {os.getcwd() + "/" + object_name + "/" + training_name + "-training" + "/Handles_pre"}')
-
-    return training_settings, Handles_post, Handles_pre
-
-def run_training(sim_config: SimulationConfig, np_object: Dict, training_settings: Dict, Handles_post):
-    import numpy as np
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-    import random, os, sys
-    import json
-    from SimplicitHelpers import *
-    from trainer import Trainer
-
-    device = sim_config.device
-    object_name = sim_config.object_name
-    training_name = sim_config.training_name
-    name_and_training_dir = object_name + "/" + training_name + "-training"
-    Handles_post.to_device(device)
-
-    t_O = torch.tensor(np_object["ObjectSamplePts"][:, 0:3]).to(device)
-    t_YMs = torch.tensor(np_object["ObjectYMs"]).unsqueeze(-1).to(device)
-    t_PRs = torch.tensor(np_object["ObjectPRs"]).unsqueeze(-1).to(device)
-    # Use torch.where to find indices where the value is equal to 2e4
-    ym_min_val = t_YMs.min()
-    ym_max_val = t_YMs.max()
-    stiffer_indices = torch.where(t_YMs == ym_max_val)[0]
-
-    TOTAL_TRAINING_STEPS = int(training_settings["NumTrainingSteps"])
-
-    ENERGY_INTERP_LINSPACE = np.linspace(0, 1, TOTAL_TRAINING_STEPS, endpoint=False)
-    LR_INTERP_LINSPCE = np.linspace(float(training_settings["LRStart"]), float(training_settings["LREnd"]),
-                                    TOTAL_TRAINING_STEPS, endpoint=True)
-    YM_INTERP_LINSPACE = np.linspace(ym_max_val.cpu().detach().numpy(), ym_max_val.cpu().detach().numpy(),
-                                     TOTAL_TRAINING_STEPS, endpoint=True)
-
-    trainer = Trainer(object_name, training_name)
-
-    print("Start Training")
-    STARTCUDATIME = torch.cuda.Event(enable_timing=True)
-    ENDCUDATIME = torch.cuda.Event(enable_timing=True)
-    losses = []
-    timings = []
-    clock = []
-
-    name_and_training_dir = trainer.name_and_training_dir
-    Handles_post = trainer.Handles_post
-    training_settings = trainer.training_settings
-
-    for e in range(1, trainer.TOTAL_TRAINING_STEPS):
-        num_handles = Handles_post.num_handles
-        batch_size = int(training_settings["TBatchSize"])
-        batchTs = getBatchOfTs(num_handles, batch_size, e).to(device).float()
-        t_batchTs = batchTs * float(training_settings["TSamplingStdev"])
-        STARTCLOCKTIME = time.time()
-        STARTCUDATIME.record()
-        l1, l2 = trainer.train_step(
-            Handles_post,
-            trainer.t_O,
-            trainer.t_YMs,
-            trainer.t_PRs,
-            trainer.loss_fcn,
-            t_batchTs,
-            e
+    def setup_model(self, np_object: Dict = None, training_settings: Dict = None):
+        Handles_pre = HandleModels(
+            num_handles=training_settings["NumHandles"],
+            num_layers=training_settings["NumLayers"],
+            layer_width=training_settings["LayerWidth"],
+            activation_func=training_settings["ActivationFunc"],
+            dim=np_object["Dim"],
+            lr_start=training_settings["LRStart"]
         )
-        ENDCUDATIME.record()
+        Handles_post = HandleModels(
+            num_handles=training_settings["NumHandles"],
+            num_layers=training_settings["NumLayers"],
+            layer_width=training_settings["LayerWidth"],
+            activation_func=training_settings["ActivationFunc"],
+            dim=np_object["Dim"],
+            lr_start=training_settings["LRStart"]
+        )
+        Handles_post.to_device(self.cfg.device)
+        Handles_pre.to_device(self.cfg.device)
+        Handles_pre.eval()
+        return Handles_post, Handles_pre
 
-        # Waits for everything to finish running
-        torch.cuda.synchronize()
-        ENDCLOCKTIME = time.time()
+    def run_training(self):
+        # Step 3
+        print("Start Training")
+        self._run_training(self.np_object, self.training_settings, self.Handles_post, self.Handles_pre)
+        print("Training complete: Handles_post weights are now initialized.")
 
-        timings.append(STARTCUDATIME.elapsed_time(ENDCUDATIME))  # milliseconds
-        clock.append(ENDCLOCKTIME - STARTCLOCKTIME)
+    def _run_training(self, np_object: Dict, training_settings: Dict, Handles_post, Handles_pre):
+        device = self.cfg.device
+        object_name = self.cfg.object_name
+        training_name = self.training_name
 
-        if e % 100 == 0:
-            print("Step: ", e, "Loss:", l1 + l2, " > l1: ", l1, " > l2: ", l2)
-        losses.append(np.array([l1 + l2, l1, l2]))
+        trainer = Trainer(object_name, training_name, np_object, training_settings, Handles_post, Handles_pre)
+        name_and_training_dir = object_name + "/" + training_name + "-training"
 
-        if e % int(training_settings["SaveHandleIts"]) == 0:
-            # Compute the moving average
+        STARTCUDATIME = torch.cuda.Event(enable_timing=True)
+        ENDCUDATIME = torch.cuda.Event(enable_timing=True)
+        losses = []
+        timings = []
+        clock = []
 
-            # save loss and handle state at current its
-            torch.save(clock, name_and_training_dir + "/clocktimes-its-" + str(e))
-            torch.save(timings, name_and_training_dir + "/timings-its-" + str(e))
-            torch.save(losses, name_and_training_dir + "/losses-its-" + str(e))
-            torch.save(Handles_post, name_and_training_dir + "/Handles_post-its-" + str(e))
+        for e in range(1, trainer.TOTAL_TRAINING_STEPS):
+            num_handles = Handles_post.num_handles
+            batch_size = int(training_settings["TBatchSize"])
+            batchTs = getBatchOfTs(num_handles, batch_size, e).to(device).float()
+            t_batchTs = batchTs * float(training_settings["TSamplingStdev"])
+            STARTCLOCKTIME = time.time()
+            STARTCUDATIME.record()
+            l1, l2 = trainer.train_step(
+                Handles_post,
+                trainer.t_O,
+                trainer.t_YMs,
+                trainer.t_PRs,
+                trainer.loss_fcn,
+                t_batchTs,
+                e
+            )
+            ENDCUDATIME.record()
 
-            torch.save(clock, name_and_training_dir + "/clocktimes")
-            torch.save(timings, name_and_training_dir + "/timings")
-            torch.save(losses, name_and_training_dir + "/losses")
-            torch.save(Handles_post, name_and_training_dir + "/Handles_post")
+            # Waits for everything to finish running
+            torch.cuda.synchronize()    # TODO (operel): remove this
+            ENDCLOCKTIME = time.time()
 
-        if e % int(training_settings["SaveSampleIts"]) == 0:
-            O = torch.tensor(trainer.np_object["ObjectSamplePts"], dtype=torch.float32, device=device)
-            for b in range(batchTs.shape[0]):
-                Ts = batchTs[b, :, :, :]
-                O_new = trainer.getX(Ts, O, Handles_post)
-                write_ply(name_and_training_dir + "/training-epoch-" + str(e) + "-batch-" + str(b) + ".ply", O_new)
+            timings.append(STARTCUDATIME.elapsed_time(ENDCUDATIME))  # milliseconds
+            clock.append(ENDCLOCKTIME - STARTCLOCKTIME)
 
-    torch.save(clock, name_and_training_dir + "/clocktimes")
-    torch.save(timings, name_and_training_dir + "/timings")
-    torch.save(losses, name_and_training_dir + "/losses")
-    torch.save(Handles_post, name_and_training_dir + "/Handles_post")
-    torch.save(trainer.Handles_pre, name_and_training_dir + "/Handles_pre")
+            if e % 100 == 0:
+                print("Step: ", e, "Loss:", l1 + l2, " > l1: ", l1, " > l2: ", l2)
+            losses.append(np.array([l1 + l2, l1, l2]))
 
-    return Handles_post, trainer.Handles_pre
+            if e % int(training_settings["SaveHandleIts"]) == 0:
+                # Compute the moving average
 
+                # save loss and handle state at current its
+                torch.save(clock, name_and_training_dir + "/clocktimes-its-" + str(e))
+                torch.save(timings, name_and_training_dir + "/timings-its-" + str(e))
+                torch.save(losses, name_and_training_dir + "/losses-its-" + str(e))
+                torch.save(Handles_post, name_and_training_dir + "/Handles_post-its-" + str(e))
 
-def define_simulation_scene():
-    scene_name = 'poke_z'
+                torch.save(clock, name_and_training_dir + "/clocktimes")
+                torch.save(timings, name_and_training_dir + "/timings")
+                torch.save(losses, name_and_training_dir + "/losses")
+                torch.save(Handles_post, name_and_training_dir + "/Handles_post")
+
+            if e % int(training_settings["SaveSampleIts"]) == 0:
+                O = torch.tensor(trainer.np_object["ObjectSamplePts"], dtype=torch.float32, device=device)
+                for b in range(batchTs.shape[0]):
+                    Ts = batchTs[b, :, :, :]
+                    O_new = trainer.getX(Ts, O, Handles_post)
+                    write_ply(name_and_training_dir + "/training-epoch-" + str(e) + "-batch-" + str(b) + ".ply", O_new)
+
+        torch.save(clock, name_and_training_dir + "/clocktimes")
+        torch.save(timings, name_and_training_dir + "/timings")
+        torch.save(losses, name_and_training_dir + "/losses")
+        torch.save(Handles_post, name_and_training_dir + "/Handles_post")
+        torch.save(Handles_pre, name_and_training_dir + "/Handles_pre")
+
+    def simulate_scene(self, scene_name: str):
+        scene = json.loads(open(f'scenes/{scene_name}.json', "r").read())
+        np_object = self.np_object
+        name_and_training_dir = self.cfg.object_name + "/" + self.training_name + "-training"
+
+        self.physics_simulator = PhysicsSimulator(
+            scene_name=scene_name, np_object=self.np_object, name_and_training_dir=name_and_training_dir
+        )
+
+        # timestep
+        random_batch_indices = np.random.randint(0, np_object["ObjectSamplePts"].shape[0],
+                                                 size=int(scene["NumCubaturePts"]))
+
+        np_X = np_object["ObjectSamplePts"][:, 0:3][random_batch_indices, :]
+        np_YMs = np_object["ObjectYMs"][random_batch_indices, np.newaxis]
+        np_Rho = np_object["ObjectRho"][random_batch_indices, np.newaxis]
+        np_PRs = np_object["ObjectPRs"][random_batch_indices, np.newaxis]
+
+        torch.save(np_X, name_and_training_dir + "/" + scene_name + "-sim_X0")
+        torch.save(np_YMs, name_and_training_dir + "/" + scene_name + "-sim_W")
+
+        states, t_X0, explicit_W = self.physics_simulator.simulate(np_X, np_YMs, np_PRs, np_Rho,
+                                                                   self.physics_simulator.E_pot, self.Handles_post)
+
+        states_path = name_and_training_dir + "/" + scene_name + "-sim_states"
+        torch.save(states, states_path)
+        torch.save(t_X0, name_and_training_dir + "/" + scene_name + "-sim_X0")
+        torch.save(explicit_W, name_and_training_dir + "/" + scene_name + "-sim_W")
+        self.simulation_states = states
+        print(f"Done simulating scene. Output saved to: {states_path}")
+        return self.animate_model()
+
+    def load_simulated_scene(self, scene_name):
+        device = self.cfg.device
+        object_name = self.cfg.object_name
+        training_name = self.training_name
+        filename = object_name + "/" + training_name + "-training" + "/" + f"{scene_name}-sim_states"
+        states = torch.load(filename,map_location=torch.device(device))
+        self.simulation_states = states
+        print(f"Loaded simulated scene from {filename}")
+        return self.animate_model()
+
+    def animate_model(self) -> TransformableGaussianModel:
+
+        model = self.cfg.model
+        sh_deg = self.cfg.model.max_sh_degree
+        transformable_model = TransformableGaussianModel(handles_model=self.Handles_post, sh_degree=sh_deg)
+        transformable_model._xyz = model._xyz
+        transformable_model._features_dc = model._features_dc
+        transformable_model._features_rest = model._features_rest
+        transformable_model._opacity = model._opacity
+        transformable_model._scaling = model._scaling
+        transformable_model._rotation = model._rotation
+        transformable_model.active_sh_degree = sh_deg
+
+        device = self.cfg.device
+        # states: List at length (num_frames); each entry is a flattened tensor of (num_handles, 3, 4)
+        states = self.simulation_states
+        num_frames = len(states)
+        transforms = torch.stack(states).reshape(num_frames, -1, 3, 4)  # (num_frames, num_handles+1, 3, 4)
+        transformable_model.transforms = transforms.to(device)  # (num_frames, num_handles+1, 3, 4)
+
+        transformable_model.x0 = transformable_model._xyz.to('cpu')
+
+        # computed_W_X0: tensor of (num_gaussians, num_handles + 1), representing the weight each handle assigns to each point at rest frame
+        # X0 = torch.tensor(self.np_object["ObjectSamplePts"], dtype=torch.float32)
+        # BATCH_SIZE = 100_000
+        # chunk_weights = []
+        # for idx, chunk in enumerate(X0.split(BATCH_SIZE)):
+        #     chunk_w = torch.cat((self.Handles_post.getAllWeightsSoftmax(chunk), torch.ones(chunk.shape[0], 1)), dim=1)
+        #     chunk_weights.append(chunk_w.cpu())
+        # weights = torch.cat(chunk_weights, dim=0)
+        # transformable_model.weights = weights.to(device)
+        return transformable_model
+
+    @property
+    def training_name(self):
+        segment_name = f"-{self.cfg.segments.name}" if isinstance(self.cfg.segments, Segment) else ""
+        training_id = f"-{self.cfg.training_id}" if len(self.cfg.training_id) > 0 else ""
+        training_name = f"{self.cfg.object_name}-training{segment_name}{training_id}"
+        return training_name
+
+    @staticmethod
+    def _save_object_record(np_object, object_name):
+        if not os.path.exists(object_name):
+            os.makedirs(object_name)
+        torch.save(np_object, object_name + "/" + object_name + "-" + "object")
+        print(f'Object saved to: {os.getcwd() + "/" + object_name + "/" + object_name + "-" + "object"}')
+
+    @staticmethod
+    def _load_object_record(object_name):
+        np_object = torch.load(f"{object_name}/{object_name}-object")
+        return np_object
+
+    @staticmethod
+    def _save_training_settings(training_settings, object_name, training_name):
+        training_folder = object_name + "/" + training_name + "-training"
+        if not os.path.exists(training_folder):
+            os.makedirs(training_folder)
+        with open(f"{training_folder}/training-settings.json", 'w', encoding='utf-8') as f:
+            json.dump(training_settings, f, ensure_ascii=False, indent=4)
+        print(f'Training settings saved to: {os.getcwd() + "/" + training_folder + "/training-settings.json"}')
+
+    @staticmethod
+    def _load_training_settings(object_name, training_name):
+        training_folder = object_name + "/" + training_name + "-training"
+        # Open JSON file with training settings
+        with open(f"{training_folder}/training-settings.json", 'r') as openfile:
+            training_settings = json.load(openfile)
+        return training_settings
+
+    @staticmethod
+    def _save_model(model, object_name, training_name, filename):
+        torch.save(model, object_name + "/" + training_name + "-training" + "/" + filename)
+        print(f'{filename} saved to: '
+              f'{os.getcwd() + "/" + object_name + "/" + training_name + "-training" + "/" + filename}')
+
+    @staticmethod
+    def _load_model(object_name, training_name, filename):
+        model = torch.load(object_name + "/" + training_name + "-training" + "/" + filename)
+        return model
+
+    @staticmethod
+    def print_named_params(handles_post):
+        print('--List of learned params:--')
+        for nnnn, pppp in handles_post.model.named_parameters():
+            print(nnnn, pppp.size())
+
+    @staticmethod
+    def print_architecture(handles_pre):
+        print('--Architecture:--')
+        print(handles_pre.__dict__)
+
+    # @staticmethod
+    # def _save_training_settings(training_dict, sim_obj_name):
+    #     if not os.path.exists(sim_obj_name):
+    #         os.makedirs(sim_obj_name)
+    #     json_object = json.dumps(training_dict, indent=4)
+    #     with open(sim_obj_name + "/" + sim_obj_name + "-training-settings.json", "w") as outfile:
+    #         outfile.write(json_object)
+    #     print(f'Training settings saved to: {os.getcwd() + "/" + sim_obj_name + "/" + sim_obj_name + "-training-settings.json"}')
+
+    # @staticmethod
+    # def _load_training_settings(object_name):
+    #     # Open JSON file with training settings
+    #     with open(f"{object_name}/{object_name}-training-settings.json", 'r') as openfile:
+    #         training_settings = json.load(openfile)
+    #     return training_settings
