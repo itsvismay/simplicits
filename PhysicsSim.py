@@ -5,20 +5,40 @@ import random, os, sys, json
 from typing import Dict
 from SimplicitHelpers import *
 from PhysicsHelpers import *
+from SimulatedScene import SimulatedScene
 
 class PhysicsSimulator:
 
-    def __init__(self, scene_name: str, np_object: Dict, name_and_training_dir: str):
+    def __init__(self, scene: SimulatedScene, np_object: Dict, name_and_training_dir: str):
         self.np_object = np_object
         self.name_and_training_dir = name_and_training_dir
 
-        self.scene_name = scene_name
-        self.scene = json.loads(open(f'scenes/{scene_name}.json', "r").read())
-        self.dt = float(self.scene["dt"])  # s
+        self.scene = scene
+        self.dt = float(self.scene.dt)  # s
         self.simulation_iteration = 0
         self.barrier_T = 0
         self.move_mask = None
         self.explicit_W = None
+
+        sim_object = scene.SimplicitObjects[0]
+        X0 = torch.tensor(np_object['ObjectSamplePts'], dtype=torch.float32, device=device)
+        N = X0.shape[0]
+        if sim_object.get("SetFixedBC_code") is not None:
+            l_dict = {"X0": X0}
+            exec(sim_object["SetFixedBC_code"], globals(), l_dict)
+            indices = l_dict["indices"]
+            self.set_fixed_bc_mask = X0.new_zeros([N,])
+            self.set_fixed_bc_mask[indices] = True
+        else:
+            self.set_fixed_bc_mask = sim_object.get("SetFixedBC")
+        if sim_object.get("SetMovingBC_code") is not None:
+            l_dict = {"X0": X0}
+            exec(sim_object["SetMovingBC_code"], globals(), l_dict)
+            indices = l_dict["indices"]
+            self.set_moving_bc_mask = X0.new_zeros([N,])
+            self.set_moving_bc_mask[indices] = True
+        else:
+            self.set_moving_bc_mask = sim_object.get("SetMovingBC")
 
     def E_Coll_Penalty(self, X, col_indices):
         col_penalty = torch.tensor(0, dtype=torch.float32, device=device)
@@ -66,38 +86,42 @@ class PhysicsSimulator:
         x_flat = B@z + x0_flat
 
         #### Fixed vertices
-        totE = float(scene["penalty_spring_fixed_weight"])*z.T@B.T@J@J.T@B@z
+        totE = float(scene.penalty_spring_fixed_weight)*z.T@B.T@J@J.T@B@z
 
-        # collE = float(scene["penalty_log_barrier_collisions"])*E_Coll_Penalty(x_flat.reshape(-1,3), col_indices=ColMap)
+        # collE = float(scene.penalty_log_barrier_collisions)*E_Coll_Penalty(x_flat.reshape(-1,3), col_indices=ColMap)
 
+        sim_object = scene.SimplicitObjects[0]
         ##### Moving vertices
         movE = torch.tensor([[0]], dtype=torch.float32).to(device)
-        if float(scene["penalty_spring_moving_weight"])>0:
+        if float(scene.penalty_spring_moving_weight)>0:
             moving_verts = x0_flat[self.move_mask].reshape(-1,3).detach()
-            l_dict = {"moving_verts": moving_verts, "dt":self.dt, "simulation_iteration": self.simulation_iteration}
-            exec(scene["SimplicitObjects"][0]["MoveBC_code"], globals(), l_dict)
-            updated_vert_positions = l_dict["updated_vert_positions"]
+            if sim_object["MoveBC_code"] is not None:
+                l_dict = {"moving_verts": moving_verts, "dt":self.dt, "simulation_iteration": self.simulation_iteration}
+                exec(scene.SimplicitObjects[0]["MoveBC_code"], globals(), l_dict)
+                updated_vert_positions = l_dict["updated_vert_positions"]
+            else:
+                updated_vert_positions = sim_object["MoveBC"]
             if updated_vert_positions != None:
                 Xs = x_flat[self.move_mask].reshape(-1, 3)
-                movE = float(scene["penalty_spring_moving_weight"])*torch.sum(torch.square(updated_vert_positions - Xs))
+                movE = float(scene.penalty_spring_moving_weight)*torch.sum(torch.square(updated_vert_positions - Xs))
 
 
         #pokes
         pokyE = torch.tensor([[0]], dtype=torch.float32).to(device)
-        if len(scene["CollisionObjects"])>0:
+        if len(scene.CollisionObjects)>0:
             dist_to_poky = torch.tensor([0], dtype=torch.float32).to(device)
-            for p in range(len(scene["CollisionObjects"])):
-                collision_object = torch.tensor(scene["CollisionObjects"][p]["Position"], dtype=torch.float32, device=device)
+            for p in range(len(scene.CollisionObjects)):
+                collision_object = torch.tensor(scene.CollisionObjects[p]["Position"], dtype=torch.float32, device=device)
                 l_dict = {"collision_obj": collision_object, "dt":self.dt, "simulation_iteration": self.simulation_iteration}
-                exec(scene["CollisionObjects"][p]["Update_code"], globals(), l_dict)
+                exec(scene.CollisionObjects[p]["Update_code"], globals(), l_dict)
                 collision_object = l_dict["pos"]
                 dist_to_poky = torch.sqrt(torch.sum((x_flat.reshape(-1,3) - collision_object)**2, dim=1))
                 min_dist_to_poky = torch.min(dist_to_poky)
-                collision_object_rad = float(scene["CollisionObjects"][0]["Radius"])
+                collision_object_rad = float(scene.CollisionObjects[0]["Radius"])
                 if torch.min(dist_to_poky)<collision_object_rad:
                     pokyE += torch.tensor(float("inf"), dtype=torch.float32).to(device)
                 else:
-                    log_dist_to_poky = -(float(scene["BarrierInitStiffness"])/(float(scene["BarrierDec"])**self.barrier_T))*torch.log(min_dist_to_poky - collision_object_rad) #log barrier is inf at collision_object_rad
+                    log_dist_to_poky = -(float(scene.BarrierInitStiffness)/(float(scene.BarrierDec)**self.barrier_T))*torch.log(min_dist_to_poky - collision_object_rad) #log barrier is inf at collision_object_rad
                     if log_dist_to_poky>0:
                         pokyE += log_dist_to_poky
                     # pos_indx = log_dist_to_poky>0
@@ -106,12 +130,12 @@ class PhysicsSimulator:
 
         #### Floor
         floorE = torch.tensor([[0]], dtype=torch.float32).to(device)
-        if float(scene["penalty_spring_floor_weight"])>0:
+        if float(scene.penalty_spring_floor_weight)>0:
             ys = x_flat[1::3]
-            masked_values = ys[ys<float(scene["Floor"])] - float(scene["Floor"])
-            floorE = float(scene["penalty_spring_floor_weight"])*torch.sum(masked_values**2)
+            masked_values = ys[ys<float(scene.Floor)] - float(scene.Floor)
+            floorE = float(scene.penalty_spring_floor_weight)*torch.sum(masked_values**2)
 
-        if len(scene["CollisionObjects"])>0:
+        if len(scene.CollisionObjects)>0:
             print("         PokeE: ", pokyE, self.barrier_T, torch.min(dist_to_poky))
         return totE + floorE + movE + pokyE# + collE
 
@@ -124,7 +148,7 @@ class PhysicsSimulator:
 
     def line_search(self, func, x, direction, gradient, alpha=0.5, beta=0.5):
         t = 10.0  # Initial step size
-        for _ in range(int(self.scene["LSIts"])):
+        for _ in range(int(self.scene.LSIts)):
             x_new = x + t * direction
             f_new = func(x_new)
             f = func(x)
@@ -152,7 +176,7 @@ class PhysicsSimulator:
 
         return torch.sum(nonzero_col_entries.square())
 
-    def simulate(self, np_X, np_YMs, np_PRs, np_Rho, Phi, Handles):
+    def simulate(self, np_X, np_YMs, np_PRs, np_Rho, Phi, Handles, fixed_bc, moving_bc):
 
         states = []
 
@@ -172,41 +196,50 @@ class PhysicsSimulator:
         num_handles = W.shape[1]
         num_samples = np_X.shape[0]
 
+        mask = fixed_bc.repeat_interleave(3)
+        self.move_mask = moving_bc.repeat_interleave(3)
 
-        #### Set moving boundary conditions
-        move_mask = torch.zeros(num_samples*3, dtype=torch.bool)
-        l_dict = {"X0": X0}
-        exec(self.scene["SimplicitObjects"][0]["SetMovingBC_code"], globals(), l_dict)
-        indices = l_dict["indices"]
-        indices = (3*indices).repeat_interleave(3)
-        indices[1::3] += 1
-        indices[2::3] += 2;
-        move_mask[indices] = True
-
-        #### Set fixed boundary conditions
-        # Create a mask to identify rows to be REMOVED
-        mask = torch.zeros(num_samples*3, dtype=torch.bool)
-        # execute code in json file to set object's fixed bc
-        l_dict = {"X0": X0}
-        exec(self.scene["SimplicitObjects"][0]["SetFixedBC_code"], globals(), l_dict)
-        indices = l_dict["indices"]
-        indices = (3*indices).repeat_interleave(3)
-        indices[1::3] += 1
-        indices[2::3] += 2;
-        # Create a mask to identify rows to be removed;
-        mask[indices] = True
+        # sim_object = self.scene.SimplicitObjects[0]
+        # #### Set moving boundary conditions
+        # if sim_object["SetMovingBC"] is not None:
+        #     move_mask = sim_object["SetMovingBC"]
+        # else:
+        #     move_mask = torch.zeros(num_samples*3, dtype=torch.bool)
+        #     l_dict = {"X0": X0}
+        #     exec(sim_object["SetMovingBC_code"], globals(), l_dict)
+        #     indices = l_dict["indices"]
+        #     indices = (3*indices).repeat_interleave(3)
+        #     indices[1::3] += 1
+        #     indices[2::3] += 2
+        #     move_mask[indices] = True
+        #
+        # #### Set fixed boundary conditions
+        # if sim_object["SetFixedBC"] is not None:
+        #     mask = sim_object["SetFixedBC"]
+        # else:
+        #     # Create a mask to identify rows to be REMOVED
+        #     mask = torch.zeros(num_samples*3, dtype=torch.bool)
+        #     # execute code in json file to set object's fixed bc
+        #     l_dict = {"X0": X0}
+        #     exec(sim_object["SetFixedBC_code"], globals(), l_dict)
+        #     indices = l_dict["indices"]
+        #     indices = (3*indices).repeat_interleave(3)
+        #     indices[1::3] += 1
+        #     indices[2::3] += 2
+        #     # Create a mask to identify rows to be removed;
+        #     mask[indices] = True
 
         #### Create an nxn identity matrix
-        Id = torch.eye(num_samples*3)
+        Id = torch.eye(num_samples*3, device=device)
         # Use the mask to remove rows from the identity matrix
         redID = Id[mask]
         J = redID.T.to(device)
 
         # 2*num samples gravities per sample point
-        grav = torch.zeros(num_samples*3).to(device)
-        grav[0::3] = float(self.scene["Gravity"][0]) #acc from gravity
-        grav[1::3] = float(self.scene["Gravity"][1]) #acc from gravity
-        grav[2::3] = float(self.scene["Gravity"][2]) #acc from gravity
+        grav = torch.zeros(num_samples*3, device=device)
+        grav[0::3] = float(self.scene.Gravity[0]) #acc from gravity
+        grav[1::3] = float(self.scene.Gravity[1]) #acc from gravity
+        grav[2::3] = float(self.scene.Gravity[2]) #acc from gravity
 
 
         #total mass of object
@@ -247,13 +280,13 @@ class PhysicsSimulator:
         Mg = M@grav
         states.append(z.clone().cpu().detach())
 
-        for step in range(int(self.scene["Steps"])):
+        for step in range(int(self.scene.Steps)):
             # set u prev at start of step
             z_prev = z.clone().detach()
 
             barrier_T = 0
-            for barrier_its in range(int(self.scene["BarrierIts"])):
-                for iter in range(int(self.scene["NewtonIts"])):
+            for barrier_its in range(int(self.scene.BarrierIts)):
+                for iter in range(int(self.scene.NewtonIts)):
                     # zero out the gradients of u
                     z.grad = None
 
@@ -279,7 +312,7 @@ class PhysicsSimulator:
                     with torch.no_grad():
                         newton_H = newton_hessE[:,0,:,0]
 
-                        if bool(self.scene["HessianSPDFix"]):
+                        if bool(self.scene.HessianSPDFix):
                             # Simple PSD fix
                             L, V = torch.linalg.eig(newton_H)
                             L = torch.real(L)
@@ -314,6 +347,6 @@ class PhysicsSimulator:
                 barrier_T += 1
             states.append(z.clone().cpu().detach())
             self.simulation_iteration += 1
-            torch.save(states, self.name_and_training_dir+"/" + self.scene_name + "-sim_states")
+            torch.save(states, self.name_and_training_dir+"/" + self.scene.Name + "-sim_states")
 
         return states, X0.cpu().detach(), W.detach()

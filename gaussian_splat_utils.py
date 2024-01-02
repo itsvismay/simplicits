@@ -66,7 +66,7 @@ def deformation_gradient(x0, handles_model, transforms):
 
 
 class TransformableGaussianModel(GaussianModel):
-    def __init__(self, handles_model, sh_degree : int):
+    def __init__(self, handles_model, sh_degree : int, animated_mask: torch.BoolTensor = None):
         super().__init__(sh_degree=sh_degree)
 
         device = self._xyz.device
@@ -76,20 +76,25 @@ class TransformableGaussianModel(GaussianModel):
         self.transforms = None      # torch.Tensor of (T, H, 3, 4)  ; T ~ number of timeframes, H ~ number of handles
         self.x0 = None              # keeps a copy of the non-deformed positions
         self.cov_t = None           # Cache cov at timestep t for better FPS
+        self.animated_mask = animated_mask   # Which gaussians should be transformable
 
-    def get_weights(self):
+        # (N, H)        ; N ~ number of gaussians, H ~ number of handles
+        self.weights = None
+
+    def init_weights(self):
         # (N, H) ; N ~ number of gaussians, H ~ number of handles
         # representing the weight each handle assigns to each point at rest frame
         x0 = super().get_xyz
+        if self.animated_mask is not None:
+            x0 = x0[self.animated_mask]
         homg_dim = torch.ones(x0.shape[0], 1, device=x0.device, dtype=x0.dtype)
         self.handles_model.to_device(x0.device)
-        weights = torch.cat((self.handles_model.getAllWeightsSoftmax(x0), homg_dim), dim=1)
-        return weights
+        self.weights = torch.cat((self.handles_model.getAllWeightsSoftmax(x0), homg_dim), dim=1)
 
     @lru_cache(maxsize=1)
     def map_pos(self, x0, keyframe):
         """ Maps points x0 -> X """
-        transforms = self.transforms[keyframe]
+        transforms = self.transforms[keyframe - 1]
         device = x0.device
         num_gaussians = x0.shape[0]
         num_handles = transforms.shape[0]
@@ -100,10 +105,8 @@ class TransformableGaussianModel(GaussianModel):
         x0_homogeneous_expanded = x0_homogeneous[:, None, :, None].expand(num_gaussians, num_handles, 4, 1)
         # (N, H, 3, 4)
         transforms_expanded = transforms[None].expand(num_gaussians, num_handles, 3, 4)
-        # (N, H)        ; N ~ number of gaussians, H ~ number of handles
-        weights = self.get_weights()
         # (N, H, 3, 1)
-        weights_expanded = weights[:, :, None, None].expand(num_gaussians, num_handles, 3, 1)
+        weights_expanded = self.weights[:, :, None, None].expand(num_gaussians, num_handles, 3, 1)
         # (N, H, 3, 1)
         xt = weights_expanded * (transforms_expanded @ x0_homogeneous_expanded)
         # (N, 3)
@@ -111,14 +114,13 @@ class TransformableGaussianModel(GaussianModel):
         X = xt + x0  # TODO (operel): should we add..? should we average..?
         return X
 
-    def map_cov(self, scaling_modifier = 1):
-        L = build_scaling_rotation(scaling_modifier * self.get_scaling, self._rotation)
-        if self.keyframe == 0 or self.transforms is None:
+    def map_cov(self, x0, scaling, rotation, keyframe=0, scaling_modifier = 1):
+        L = build_scaling_rotation(scaling_modifier * scaling, rotation)
+        if keyframe == 0 or self.transforms is None:
             actual_covariance = L @ L.transpose(1, 2)
         else:
             # deformation gradient
-            x0 = self._xyz
-            F = deformation_gradient(x0, self.handles_model, self.transforms[self.keyframe])
+            F = deformation_gradient(x0, self.handles_model, self.transforms[keyframe - 1])
             transformed_L = F @ L
             actual_covariance = transformed_L @ transformed_L.transpose(1, 2)
         symm = strip_symmetric(actual_covariance)
@@ -129,8 +131,17 @@ class TransformableGaussianModel(GaussianModel):
             self.keyframe = keyframe
             self._xyz = self.x0.to(self._xyz.device)
             if self.keyframe > 0 and self.transforms is not None:
-                self._xyz = self.map_pos(self._xyz, keyframe=self.keyframe)
-                self.cov_t = self.map_cov()
+                if self.animated_mask is None:
+                    self._xyz = self.map_pos(self._xyz, keyframe=self.keyframe)
+                    self.cov_t = self.map_cov(self._xyz, self.get_scaling, self._rotation, keyframe=self.keyframe)
+                else:
+                    transformed_pos = self.map_pos(self._xyz[self.animated_mask], keyframe=self.keyframe)
+                    self.cov_t = self.map_cov(self._xyz, self.get_scaling, self._rotation)
+                    self.cov_t[self.animated_mask] = self.map_cov(
+                        self._xyz[self.animated_mask], self.get_scaling[self.animated_mask],
+                        self._rotation[self.animated_mask], keyframe=self.keyframe
+                    )
+                    self._xyz[self.animated_mask] = transformed_pos
 
     def get_covariance(self, scaling_modifier=1):
         if self.cov_t is None:

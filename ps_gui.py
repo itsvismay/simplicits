@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import os.path
 
 import torch
@@ -406,7 +407,7 @@ class NewSegmentDialog:
                 psim.SetKeyboardFocusHere(0)
             _, self.pending_name = psim.InputText("Segment Name", self.pending_name, psim.ImGuiInputTextFlags_AutoSelectAll)
             if psim.Button("Ok") or psim.IsKeyDown(KeyHandler.KEY_ENTER):
-                segment = Segment(mask=copy.deepcopy(self.current_mask), name=self.pending_name)
+                segment = Segment(mask=copy.deepcopy(self.current_mask.detach()), name=self.pending_name)
                 self.segments[segment.name] = segment
                 self.current_mask = None
                 self.should_open = False
@@ -420,6 +421,81 @@ class NewSegmentDialog:
             return True
         else:
             return False
+
+class StageForcesDialog:
+    stage_forces_modal_id = "Stage Forces"
+
+    def __init__(self):
+        self.simplicits_simulator = None
+        self.available_mask = None
+        self.is_open = False
+        self.temp_fixed_bc_mask = None
+        self.temp_moving_bc_mask = None
+        self.current_fixed_bc_mask = None
+        self.current_moving_bc_mask = None
+        self.object_name = None
+
+    def open(self, payload: CallbackPayload, simplicits_simulator: SimplicitsSimulator):
+        self.simplicits_simulator = simplicits_simulator
+        object_name = simplicits_simulator.cfg.object_name
+        staged_segments = simplicits_simulator.cfg.segments
+
+        gaussians_pos = payload.model.get_xyz
+        N = gaussians_pos.shape[0]
+        available_mask = gaussians_pos.new_zeros(N, dtype=torch.bool)
+        for segment in staged_segments.values():
+            available_mask |= segment.mask
+        self.available_mask = available_mask
+        self.temp_fixed_bc_mask = gaussians_pos.new_zeros(N, dtype=torch.bool)
+        self.temp_moving_bc_mask = gaussians_pos.new_zeros(N, dtype=torch.bool)
+        self.object_name = object_name
+        self.is_open = True
+
+    def show_dialog(self, payload: CallbackPayload):
+        if not self.is_open:
+            self.simplicits_simulator = None
+            self.available_mask = None
+            self.is_open = False
+            self.temp_fixed_bc_mask = None
+            self.temp_moving_bc_mask = None
+            self.object_name = None
+        else:
+            _, self.is_open = psim.Begin(self.window_name, True, psim.ImGuiWindowFlags_AlwaysAutoResize)
+            if psim.Button("Set Fixed Boundary Conditions", (250, 30)):
+                if payload.last_selection is not None and payload.last_selection.mask is not None:
+                    self.temp_fixed_bc_mask = payload.last_selection.mask & self.available_mask
+            if psim.Button("Set Moving Boundary Conditions", (250, 30)):
+                if payload.last_selection is not None and payload.last_selection.mask is not None:
+                    self.temp_moving_bc_mask = payload.last_selection.mask & self.available_mask
+            if psim.Button("Ok") or psim.IsKeyDown(KeyHandler.KEY_ENTER):
+                self.current_fixed_bc_mask = self.temp_fixed_bc_mask
+                self.current_moving_bc_mask = self.temp_moving_bc_mask
+                simulated_objects_mask = torch.from_numpy(self.simplicits_simulator.np_object['SimulatedMask'])
+                simulated_objects_mask = simulated_objects_mask.to(self.current_fixed_bc_mask.device)
+                gravity = -9.8
+                scene = SimulatedScene(
+                    Name=self.object_name + 'Scene',
+                    Steps=50,
+                    Gravity=(0, gravity * math.cos(math.radians(30)), gravity * math.sin(math.radians(30)))
+                )
+                scene.add_object(
+                    name=self.object_name,
+                    position_delta=(0, 0, 0),
+                    fixed_bc=self.current_fixed_bc_mask[simulated_objects_mask],
+                    moving_bc=self.current_moving_bc_mask[simulated_objects_mask]
+                )
+                self.simplicits_simulator.set_scene(scene)
+                self.is_open = False
+            psim.SameLine()
+            if psim.Button("Cancel") or psim.IsKeyDown(KeyHandler.KEY_ESCAPE):
+                self.is_open = False
+            psim.End()
+            return True
+        return False
+
+    @property
+    def window_name(self):
+        return f'{self.stage_forces_modal_id} ({self.object_name})'
 
 class GUI:
     def __init__(self, conf: GUIConfig, model, initial_camera: GSCamera = None, scene_bbox=None, dataset=None):
@@ -456,8 +532,8 @@ class GUI:
         self.dataset = dataset  # optional, for visualizing assets like cameras
         self.model = model      # the scene graph of objects displayed
         self.preview_buffers = dict(
-            _features_dc=copy.deepcopy(model._features_dc),
-            _opacity=copy.deepcopy(model._opacity)
+            _features_dc=copy.deepcopy(model._features_dc.detach()),
+            _opacity=copy.deepcopy(model._opacity.detach())
         )
         self.pipeline = GSplatPipelineParams()
         self.background = torch.tensor(conf.background_color, dtype=torch.float32, device=DEFAULT_DEVICE)
@@ -516,10 +592,13 @@ class GUI:
         ps.set_user_callback(self.ps_ui_callback)
         ps.set_structure_callback(self.ps_structure_callback)
         self.new_segment_dialog = NewSegmentDialog(segments=self.segments)
+        self.stage_forces_dialog = StageForcesDialog()
         self.drag_handler = DragHandler()
         self.key_handler = KeyHandler()
         # Holds the info of the currently existing selection in the gui
         self.current_selection: GSplatSelection = GSplatSelection()
+        # Holds the info on current boundary conditions (type -> mask of splats affected by a certain bc)
+        self.boundary_conditions: Dict[str, torch.BoolTensor] = dict()
 
         # Drives the dynamics training and simulation, only initialized upon request
         self.simplicits_simulator: SimplicitsSimulator = None
@@ -743,7 +822,7 @@ class GUI:
             # )
             if not segment.is_enabled:
                 mask &= ~segment.mask
-            self.preview_buffers['_opacity'] = copy.deepcopy(self.model._opacity)
+            self.preview_buffers['_opacity'] = copy.deepcopy(self.model._opacity.detach())
             self.preview_buffers['_opacity'][~mask] = -10000.0
 
         # do the actual rendering
@@ -802,7 +881,7 @@ class GUI:
                     psim.SameLine()
                     psim.Button(f'Options')
                     if psim.Button(f'Select'):
-                        self.current_selection.mask = copy.deepcopy(segment.mask)
+                        self.current_selection.mask = copy.deepcopy(segment.mask.detach())
                     if segment.name != 'Background':
                         psim.SameLine()
                         if psim.Button(f'Delete'):
@@ -815,7 +894,7 @@ class GUI:
                             psim.PushId(att_name)
                             # psim.ImGuiSliderFlags_Logarithmic
                             psim.PushItemWidth(100)
-                            is_updated, new_value = psim.SliderFloat(att_name, att_value, 1e-3, 1e3, "%.4f")
+                            is_updated, new_value = psim.SliderFloat(att_name, att_value, 1e-3, 1e4, "%.4f")
                             psim.PopItemWidth()
                             if is_updated:
                                 to_write[att_name] = new_value
@@ -824,6 +903,26 @@ class GUI:
                             segment.attributes[att_name] = new_val
                         psim.TreePop()
 
+                    # Boundary Conditions, if any
+                    seg_fixed_bc = seg_moving_bc = None
+                    fixed_bc = self.boundary_conditions.get('fixed_bc')
+                    moving_bc = self.boundary_conditions.get('moving_bc')
+                    if fixed_bc is not None:
+                        seg_fixed_bc = segment.mask & fixed_bc
+                        seg_fixed_bc = seg_fixed_bc if seg_fixed_bc.sum() > 0 else None
+                    if moving_bc is not None:
+                        seg_moving_bc = segment.mask & moving_bc
+                        seg_moving_bc = seg_moving_bc if seg_moving_bc.sum() > 0 else None
+                    if seg_fixed_bc is not None or seg_moving_bc is not None:
+                        psim.SetNextItemOpen(True, psim.ImGuiCond_FirstUseEver)
+                        if psim.TreeNode("Boundary Conditions"):
+                            if seg_fixed_bc is not None:
+                                if psim.Button(f'Show Fixed Boundary Cond.'):
+                                    self.current_selection.mask = seg_fixed_bc
+                            if seg_moving_bc is not None:
+                                if psim.Button(f'Show Moving Boundary Cond.'):
+                                    self.current_selection.mask = seg_moving_bc
+                            psim.TreePop()
                     psim.TreePop()
                 psim.PopID()
 
@@ -831,7 +930,7 @@ class GUI:
             self.segments['Background'].mask |= seg.mask
             del self.segments[seg.name]
 
-    def draw_main_menu(self):
+    def draw_main_menu(self, payload: CallbackPayload):
         if psim.BeginMainMenuBar():
             if psim.BeginMenu("File"):
                 if psim.MenuItem("New", "Ctrl+N"):
@@ -860,19 +959,34 @@ class GUI:
                 psim.MenuItem("Redo", "Ctrl+Shift+Z", enabled=False)
                 psim.EndMenu()
             if psim.BeginMenu("Run"):
-                if psim.MenuItem("Setup New Simulation", "Ctrl+1"):
-                    self.setup_new_simulation()
-                if psim.MenuItem("Load Previous Handles Setup", "Ctrl+2"):
-                    self.load_existing_simulation_setup()
-                if psim.MenuItem("Train Handles Simulation", "Ctrl+3", enabled=self.simplicits_simulator is not None):
-                    self.simplicits_simulator.run_training()
-                psim.MenuItem("Stage Forces..", "Ctrl+4", enabled=self.simplicits_simulator is not None)
-                if psim.MenuItem("Simulate Dynamics", "Ctrl+5", enabled=self.simplicits_simulator is not None):
-                    self.model = self.simplicits_simulator.simulate_scene('poke_z')
-                    self.prune_redundant_gaussians()    # TODO (operel): Hacky way around out of mem
-                    self.simplicits_simulator.cfg.model = self.model
-                if psim.MenuItem("Load Previous Dynamics", "Ctrl+6", enabled=self.simplicits_simulator is not None):
-                    self.model = self.simplicits_simulator.load_simulated_scene('poke_z')
+                if psim.MenuItem("Setup New Handles Training", "Ctrl+1"):
+                    foreground_segments = {k:v for k,v in self.segments.items() if k != 'Background'}
+                    self.setup_new_simulation(foreground_segments)
+                if psim.MenuItem("Train Handles", "Ctrl+2", enabled=self.simplicits_simulator is not None):
+                    with torch.enable_grad():
+                        self.simplicits_simulator.run_training()
+                if psim.MenuItem("Load Trained Handles", "Ctrl+3"):
+                    foreground_segments = {k: v for k, v in self.segments.items() if k != 'Background'}
+                    self.load_existing_simulation_setup(foreground_segments)
+                if psim.MenuItem("Stage Scene..", "Ctrl+4",
+                                 enabled=self.simplicits_simulator is not None and \
+                                         self.stage_forces_dialog is not None and \
+                                         not self.stage_forces_dialog.is_open):
+                    self.stage_forces_dialog.open(payload=payload, simplicits_simulator=self.simplicits_simulator)
+                if psim.MenuItem("Load Scene", "Ctrl+5",
+                                 enabled=self.simplicits_simulator is not None):
+                    self.simplicits_simulator.load_scene('poke_z')  # TODO (operel): Take as input
+                if psim.MenuItem("Simulate Dynamics", "Ctrl+6",
+                                 enabled=self.simplicits_simulator is not None and \
+                                         self.simplicits_simulator.scene is not None):
+                    with torch.enable_grad():
+                        self.model = self.simplicits_simulator.simulate_scene()
+                        self.prune_redundant_gaussians()    # TODO (operel): Hacky way around out of mem
+                        self.simplicits_simulator.cfg.model = self.model
+                if psim.MenuItem("Load Previous Simulation", "Ctrl+7",
+                                 enabled=self.simplicits_simulator is not None and \
+                                         self.simplicits_simulator.scene is not None):
+                    self.model = self.simplicits_simulator.load_simulated_scene()
                     self.prune_redundant_gaussians()    # TODO (operel): Hacky way around out of mem
                     self.simplicits_simulator.cfg.model = self.model
                 psim.EndMenu()
@@ -889,7 +1003,10 @@ class GUI:
         self.model._opacity = self.model._opacity[opacity_mask]
 
         if isinstance(self.model, TransformableGaussianModel):
-            self.model.x0 = self.model.x0[opacity_mask.to(self.model.x0.device)]
+            model_mask = opacity_mask.to(self.model.x0.device)
+            self.model.x0 = self.model.x0[model_mask]
+            self.model.animated_mask = self.model.animated_mask[model_mask]
+            self.model.init_weights()
 
         for segment in self.segments.values():
             segment.mask = segment.mask[opacity_mask]
@@ -900,13 +1017,29 @@ class GUI:
         self.preview_buffers = {buffer_name: buffer[opacity_mask]
                                 for buffer_name, buffer in self.preview_buffers.items()}
 
+        self.boundary_conditions = {buffer_name: buffer[opacity_mask]
+                                    for buffer_name, buffer in self.boundary_conditions.items()}
+
 
     @torch.no_grad()
     def ps_ui_callback(self):
-        self.draw_main_menu()
+        payload = CallbackPayload(
+            model=self.model,
+            camera=ps.get_view_camera_parameters(),
+            last_selection=self.current_selection,
+            selection_preview=self.current_selection,
+            segments=self.segments,
+        )
 
-        # If modal dialog is open avoid the rest of the logic
-        if self.new_segment_dialog.show_dialog():
+        # Draw main menu and possibly open dialogs
+        self.draw_main_menu(payload)
+
+        # Handle dialog of boundary conditions - show it if needed, and update state with latest boundary conditions
+        if self.stage_forces_dialog.show_dialog(payload): # Only shows if dialog is open
+            self.boundary_conditions['fixed_bc'] = self.stage_forces_dialog.current_fixed_bc_mask
+            self.boundary_conditions['moving_bc'] = self.stage_forces_dialog.current_moving_bc_mask
+
+        if self.new_segment_dialog.show_dialog(): # If modal dialog is open avoid the rest of the logic
             return
 
         if self.model is not None and isinstance(self.model, TransformableGaussianModel):
@@ -954,19 +1087,12 @@ class GUI:
             psim.TreePop()
 
             with torch.no_grad():
-                payload = CallbackPayload(
-                    model=self.model,
-                    camera=ps.get_view_camera_parameters(),
-                    last_selection=self.current_selection,
-                    selection_preview=self.current_selection,
-                    segments=self.segments,
-                )
                 self.drag_handler.handle_callback(payload)
                 self.key_handler.handle_callback(payload)
                 self.current_selection = payload.last_selection
 
                 # Update selection color
-                self.preview_buffers['_features_dc'] = copy.deepcopy(self.model._features_dc)
+                self.preview_buffers['_features_dc'] = copy.deepcopy(self.model._features_dc.detach())
                 if self.current_selection is not None and len(self.current_selection) > 0:
                     self.preview_buffers['_features_dc'][self.current_selection.mask] = 1.0
                     # self.preview_buffers['_features_dc'][self.current_selection.mask] = torch.tensor([0.0, 0.0, 1.0], device='cuda')
@@ -993,7 +1119,9 @@ class GUI:
             new_training=True
         )
         self.simplicits_simulator = SimplicitsSimulator(sim_config)
-        print(f"Creating new simulation setup for object {self.conf.object_name}")
+        if isinstance(segment, dict):
+            print(f"Creating new simulation setup for object {self.conf.object_name} on segments: " +
+                  f", ".join({seg_name for seg_name in segment.keys()}))
 
     def load_existing_simulation_setup(self, segment: Segment=None):
         sim_config = SimulationConfig(
@@ -1004,6 +1132,9 @@ class GUI:
         )
         self.simplicits_simulator = SimplicitsSimulator(sim_config)
         print(f"Loading existing simulation setup for object {self.conf.object_name}")
+        if isinstance(segment, dict):
+            print(f"Simulated segments: " +
+                  f", ".join({seg_name for seg_name in segment.keys()}))
 
 
 @dataclass
@@ -1015,6 +1146,7 @@ class SimulationConfig:
     segments: Union[Segment, Dict] = None
     model: GaussianModel = None
     new_training: bool = False                # If False, will try to load previous training, else start new training
+    poisson_infilling: bool = True              # If True, will fill the object volume with additional sample points
 
     training_id: str = ""                     # Identifier for this dynamics training session
     training_num_skinning_handles: int = 40   # Number of skinning handles
@@ -1036,6 +1168,7 @@ import torch.nn.functional as F
 from SetupObject_1 import getDefaultTrainingSettings
 from SimplicitHelpers import *
 from PhysicsSim import PhysicsSimulator
+from SimulatedScene import SimulatedScene
 from trainer import Trainer
 
 class SimplicitsSimulator:
@@ -1066,6 +1199,7 @@ class SimplicitsSimulator:
         self.np_object, self.training_settings = np_object, training_settings
         self.Handles_post, self.Handles_pre = Handles_post, Handles_pre
 
+        self.scene = None
         self.physics_simulator = None
         self.simulation_states = None
 
@@ -1088,21 +1222,39 @@ class SimplicitsSimulator:
         model = self.cfg.model
         if isinstance(self.cfg.segments, Segment):
             segment = self.cfg.segments
-            N = segment.mask.sum()
-            gs_pos = model.get_xyz[segment.mask]
-            gs_rgb = model._features_dc[segment.mask].squeeze(1)
+            simulated_mask = segment.mask
+            N = simulated_mask.sum()
+            gs_pos = model.get_xyz[simulated_mask]
+            gs_rgb = model._features_dc[simulated_mask].squeeze(1)
             gs_YMs = torch.full(N, segment.attributes["Young's Modulus"])
             gs_PRs = torch.full(N, segment.attributes["Poisson Ratio"])
             gs_Rho = torch.full(N, segment.attributes["Rho"])
-        else:
+        else: # Dict of segements, could be only some of the segments!
             gs_pos = model.get_xyz
-            gs_rgb = model._features_dc.squeeze(1)
             N = gs_pos.shape[0]
+            simulated_mask = torch.zeros(N, dtype=bool, device=gs_pos.device)
+            for seg in self.cfg.segments.values():
+                simulated_mask |= seg.mask
+            gs_pos = model.get_xyz[simulated_mask]
+            gs_rgb = model._features_dc[simulated_mask].squeeze(1)
             gs_YMs, gs_PRs, gs_Rho = torch.ones(N), torch.ones(N), torch.ones(N)
             for seg in self.cfg.segments.values():
                 gs_YMs[seg.mask] = seg.attributes["Young's Modulus"]
                 gs_PRs[seg.mask] = seg.attributes["Poisson Ratio"]
                 gs_Rho[seg.mask] = seg.attributes["Rho"]
+            simulated_mask = simulated_mask.cpu()
+            gs_YMs = gs_YMs[simulated_mask]
+            gs_PRs = gs_PRs[simulated_mask]
+            gs_Rho = gs_Rho[simulated_mask]
+        # else:  # Full dictionary of all segments
+            # gs_pos = model.get_xyz
+            # gs_rgb = model._features_dc.squeeze(1)
+            # N = gs_pos.shape[0]
+            # gs_YMs, gs_PRs, gs_Rho = torch.ones(N), torch.ones(N), torch.ones(N)
+            # for seg in self.cfg.segments.values():
+            #     gs_YMs[seg.mask] = seg.attributes["Young's Modulus"]
+            #     gs_PRs[seg.mask] = seg.attributes["Poisson Ratio"]
+            #     gs_Rho[seg.mask] = seg.attributes["Rho"]
 
         np_object = {
             "Name": self.cfg.object_name,
@@ -1118,7 +1270,8 @@ class SimplicitsSimulator:
             "ObjectVol": 1,
             "SurfV": None,
             "SurfF": None,
-            "MarchingCubesRes": -1
+            "MarchingCubesRes": -1,
+            "SimulatedMask": simulated_mask.cpu().detach().numpy()  # Which gaussians of the model were simulated
         }
         return np_object
 
@@ -1231,29 +1384,39 @@ class SimplicitsSimulator:
         torch.save(Handles_post, name_and_training_dir + "/Handles_post")
         torch.save(Handles_pre, name_and_training_dir + "/Handles_pre")
 
-    def simulate_scene(self, scene_name: str):
-        scene = json.loads(open(f'scenes/{scene_name}.json', "r").read())
+    def set_scene(self, scene: SimulatedScene):
+        self.scene = scene
+
+    def load_scene(self, scene_name: str):
+        self.scene = SimulatedScene.from_json(scene_name)
+
+    def simulate_scene(self):
+        scene = self.scene
         np_object = self.np_object
         name_and_training_dir = self.cfg.object_name + "/" + self.training_name + "-training"
 
         self.physics_simulator = PhysicsSimulator(
-            scene_name=scene_name, np_object=self.np_object, name_and_training_dir=name_and_training_dir
+            scene=scene, np_object=self.np_object, name_and_training_dir=name_and_training_dir
         )
 
         # timestep
         random_batch_indices = np.random.randint(0, np_object["ObjectSamplePts"].shape[0],
-                                                 size=int(scene["NumCubaturePts"]))
+                                                 size=int(scene.NumCubaturePts))
 
         np_X = np_object["ObjectSamplePts"][:, 0:3][random_batch_indices, :]
         np_YMs = np_object["ObjectYMs"][random_batch_indices, np.newaxis]
         np_Rho = np_object["ObjectRho"][random_batch_indices, np.newaxis]
         np_PRs = np_object["ObjectPRs"][random_batch_indices, np.newaxis]
+        fixed_bc = self.physics_simulator.set_fixed_bc_mask[random_batch_indices]
+        moving_bc = self.physics_simulator.set_fixed_bc_mask[random_batch_indices]
 
+        scene_name = self.scene.Name
         torch.save(np_X, name_and_training_dir + "/" + scene_name + "-sim_X0")
         torch.save(np_YMs, name_and_training_dir + "/" + scene_name + "-sim_W")
 
         states, t_X0, explicit_W = self.physics_simulator.simulate(np_X, np_YMs, np_PRs, np_Rho,
-                                                                   self.physics_simulator.E_pot, self.Handles_post)
+                                                                   self.physics_simulator.E_pot, self.Handles_post,
+                                                                   fixed_bc, moving_bc)
 
         states_path = name_and_training_dir + "/" + scene_name + "-sim_states"
         torch.save(states, states_path)
@@ -1263,7 +1426,9 @@ class SimplicitsSimulator:
         print(f"Done simulating scene. Output saved to: {states_path}")
         return self.animate_model()
 
-    def load_simulated_scene(self, scene_name):
+    def load_simulated_scene(self, scene_name=None):
+        if scene_name is None:
+            scene_name = self.scene.Name
         device = self.cfg.device
         object_name = self.cfg.object_name
         training_name = self.training_name
@@ -1277,7 +1442,11 @@ class SimplicitsSimulator:
 
         model = self.cfg.model
         sh_deg = self.cfg.model.max_sh_degree
-        transformable_model = TransformableGaussianModel(handles_model=self.Handles_post, sh_degree=sh_deg)
+        transformable_model = TransformableGaussianModel(
+            handles_model=self.Handles_post,
+            sh_degree=sh_deg,
+            animated_mask=self.np_object['SimulatedMask']
+        )
         transformable_model._xyz = model._xyz
         transformable_model._features_dc = model._features_dc
         transformable_model._features_rest = model._features_rest
@@ -1285,6 +1454,7 @@ class SimplicitsSimulator:
         transformable_model._scaling = model._scaling
         transformable_model._rotation = model._rotation
         transformable_model.active_sh_degree = sh_deg
+        transformable_model.init_weights()
 
         device = self.cfg.device
         # states: List at length (num_frames); each entry is a flattened tensor of (num_handles, 3, 4)
