@@ -194,7 +194,7 @@ class Segment:
 
     def define_attributes(self):
         return {
-            "Young's Modulus": 1e3,
+            "Young's Modulus [MPa]": 1e1,
             "Rho": 1e2,
             "Poisson Ratio": 0.45,
         }
@@ -475,7 +475,7 @@ class StageForcesDialog:
                 gravity = -9.8
                 scene = SimulatedScene(
                     Name=self.object_name + 'Scene',
-                    Steps=50,
+                    Steps=100,
                     Gravity=(0, gravity * math.cos(math.radians(30)), gravity * math.sin(math.radians(30)))
                 )
                 scene.add_object(
@@ -599,6 +599,10 @@ class GUI:
         self.current_selection: GSplatSelection = GSplatSelection()
         # Holds the info on current boundary conditions (type -> mask of splats affected by a certain bc)
         self.boundary_conditions: Dict[str, torch.BoolTensor] = dict()
+        # When playing the animation continuously, measures the time elapsed since the last update
+        self.play_animation_elapsed_from_update = None
+        # When playing the animation continuously, measures the rate at which timesteps elapse
+        self.play_animation_update_rate = 0.1
 
         # Drives the dynamics training and simulation, only initialized upon request
         self.simplicits_simulator: SimplicitsSimulator = None
@@ -894,7 +898,10 @@ class GUI:
                             psim.PushId(att_name)
                             # psim.ImGuiSliderFlags_Logarithmic
                             psim.PushItemWidth(100)
-                            is_updated, new_value = psim.SliderFloat(att_name, att_value, 1e-3, 1e4, "%.4f")
+                            if '[MPa]' in att_name:
+                                is_updated, new_value = psim.SliderFloat(att_name, att_value, 1e-3, 1e3, "%.5f", power=2)
+                            else:
+                                is_updated, new_value = psim.SliderFloat(att_name, att_value, 1e-2, 1e3, "%.3f", power=2)
                             psim.PopItemWidth()
                             if is_updated:
                                 to_write[att_name] = new_value
@@ -932,6 +939,7 @@ class GUI:
 
     def draw_main_menu(self, payload: CallbackPayload):
         if psim.BeginMainMenuBar():
+
             if psim.BeginMenu("File"):
                 if psim.MenuItem("New", "Ctrl+N"):
                     self.segments.clear()
@@ -958,7 +966,7 @@ class GUI:
                 psim.MenuItem("Undo", "Ctrl+Z", enabled=False)
                 psim.MenuItem("Redo", "Ctrl+Shift+Z", enabled=False)
                 psim.EndMenu()
-            if psim.BeginMenu("Run"):
+            if psim.BeginMenu("Dynamics"):
                 if psim.MenuItem("Setup New Handles Training", "Ctrl+1"):
                     foreground_segments = {k:v for k,v in self.segments.items() if k != 'Background'}
                     self.setup_new_simulation(foreground_segments)
@@ -979,6 +987,11 @@ class GUI:
                 if psim.MenuItem("Simulate Dynamics", "Ctrl+6",
                                  enabled=self.simplicits_simulator is not None and \
                                          self.simplicits_simulator.scene is not None):
+                    # Set the object from the latest gui material properties, so we don't have to restart training
+                    # i.e. if YM values changed
+                    foreground_segments = {k: v for k, v in self.segments.items() if k != 'Background'}
+                    object_to_simulate = self.simplicits_simulator.prepare_object_record(foreground_segments)
+                    self.simplicits_simulator.np_object = object_to_simulate
                     with torch.enable_grad():
                         self.model = self.simplicits_simulator.simulate_scene()
                         self.prune_redundant_gaussians()    # TODO (operel): Hacky way around out of mem
@@ -1044,16 +1057,36 @@ class GUI:
 
         if self.model is not None and isinstance(self.model, TransformableGaussianModel):
             psim.SetNextItemOpen(True, psim.ImGuiCond_FirstUseEver)
+
             if psim.TreeNode("Animation"):
+                if self.play_animation_elapsed_from_update is None: # Animation off -- play it
+                    if psim.Button("Play"): # TODO (operel): After fixing custom font glyps, add ▶ , ◾ / ▐▐
+                        self.play_animation_elapsed_from_update = time.time()
+                else:   # Animation on
+                    # Skip to next timestep if it's time
+                    if time.time() - self.play_animation_elapsed_from_update > self.play_animation_update_rate:
+                        keyframe = (self.model.keyframe + 1) % self.model.num_keyframes
+                        self.model.set_timestep(keyframe)
+                        self.play_animation_elapsed_from_update = time.time()
+                    if psim.Button("Stop"):
+                        self.play_animation_elapsed_from_update = None
+                psim.SameLine()
                 _, keyframe = psim.SliderInt("Timestep", self.model.keyframe, 0, self.model.num_keyframes)
                 self.model.set_timestep(keyframe)
+
+                psim.PushItemWidth(150)
+                speed = int(1 / self.play_animation_update_rate)
+                _, speed = psim.SliderInt("Animation Speed", speed, 1, 100)
+                self.play_animation_update_rate = 1 / speed
+                psim.PopItemWidth()
+
                 psim.TreePop()
 
         psim.SetNextItemOpen(True, psim.ImGuiCond_FirstUseEver)
         if psim.TreeNode("Training"):
             # _, self.viz_do_train = psim.Checkbox("Train", self.viz_do_train)
             # psim.SameLine()
-            _, self.live_update = psim.Checkbox("Update View", self.live_update)
+            _, self.live_update = psim.Checkbox("Update View", self.live_update)  #  ⟳
 
             psim.TreePop()
 
@@ -1180,7 +1213,7 @@ class SimplicitsSimulator:
 
         if self.cfg.new_training:
             # Step 1
-            np_object = self.prepare_object_record()
+            np_object = self.prepare_object_record(self.cfg.segments)
             training_settings = self.prepare_training_settings()
             self._save_object_record(np_object, object_name)
             self._save_training_settings(training_settings, object_name, training_name)
@@ -1215,20 +1248,19 @@ class SimplicitsSimulator:
         # plot_implicit(np_object["ObjectSamplePts"], np_object["ObjectYMs"] )
 
     # Step 1a
-    def prepare_object_record(self) -> Dict:
+    def prepare_object_record(self, segments: Union[Segment, Dict[str, Segment]]) -> Dict:
         """
         segment: If specified, runs simulation on isolated segment, else uses all segments
         """
         model = self.cfg.model
-        if isinstance(self.cfg.segments, Segment):
-            segment = self.cfg.segments
-            simulated_mask = segment.mask
+        if isinstance(segments, Segment):
+            simulated_mask = segments.mask
             N = simulated_mask.sum()
             gs_pos = model.get_xyz[simulated_mask]
             gs_rgb = model._features_dc[simulated_mask].squeeze(1)
-            gs_YMs = torch.full(N, segment.attributes["Young's Modulus"])
-            gs_PRs = torch.full(N, segment.attributes["Poisson Ratio"])
-            gs_Rho = torch.full(N, segment.attributes["Rho"])
+            gs_YMs = torch.full(N, segments.attributes["Young's Modulus [MPa]"] * 1e6)
+            gs_PRs = torch.full(N, segments.attributes["Poisson Ratio"])
+            gs_Rho = torch.full(N, segments.attributes["Rho"])
         else: # Dict of segements, could be only some of the segments!
             gs_pos = model.get_xyz
             N = gs_pos.shape[0]
@@ -1239,7 +1271,7 @@ class SimplicitsSimulator:
             gs_rgb = model._features_dc[simulated_mask].squeeze(1)
             gs_YMs, gs_PRs, gs_Rho = torch.ones(N), torch.ones(N), torch.ones(N)
             for seg in self.cfg.segments.values():
-                gs_YMs[seg.mask] = seg.attributes["Young's Modulus"]
+                gs_YMs[seg.mask] = seg.attributes["Young's Modulus [MPa]"] * 1e6
                 gs_PRs[seg.mask] = seg.attributes["Poisson Ratio"]
                 gs_Rho[seg.mask] = seg.attributes["Rho"]
             simulated_mask = simulated_mask.cpu()
